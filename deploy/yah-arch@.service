@@ -1,0 +1,19 @@
+[Unit]
+Description=Yahoo Mail archiver (%i)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=yaharch
+Group=yaharch
+WorkingDirectory=/opt/yah-arch/src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/yah-arch/venv/bin/python /opt/yah-arch/src/archiver.py --account %i
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
