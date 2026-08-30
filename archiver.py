@@ -27,13 +27,10 @@ from email.parser import BytesHeaderParser
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-from b2sdk.v3 import AuthInfoCache, B2Api, InMemoryAccountInfo
-
-
-B2_CONFIG_PATH = Path("/etc/yah-arch/b2.env")
-YAHOO_CONFIG_PATH = Path("/etc/yah-arch/yahoo.env")
-DATABASE_PATH = Path("/var/lib/yah-arch/data/catalog.sqlite3")
-TEMP_DIRECTORY = Path("/var/lib/yah-arch/tmp")
+CONFIG_DIRECTORY = Path("/etc/yah-arch")
+STATE_DIRECTORY = Path("/var/lib/yah-arch")
+B2_CONFIG_PATH = CONFIG_DIRECTORY / "b2.env"
+ACCOUNT_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 
 IMAP_HOST = "imap.mail.yahoo.com"
 IMAP_PORT = 993
@@ -63,6 +60,18 @@ class MessageMetadata:
     sender: str
     recipients: str
     subject: str
+
+
+@dataclass(frozen=True)
+class RuntimePaths:
+    """Account-specific paths and the account's immutable B2 namespace."""
+
+    account: str
+    b2_config_path: Path
+    yahoo_config_path: Path
+    database_path: Path
+    temp_directory: Path
+    b2_message_prefix: str
 
 
 def utc_now() -> datetime:
@@ -108,11 +117,39 @@ def parse_positive_int(value: str | None, default: int, name: str) -> int:
     return result
 
 
+def validate_account_name(value: str) -> str:
+    """Return a safe account identifier or raise an argparse-friendly error."""
+
+    if not ACCOUNT_NAME_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError(
+            "account must be 1-32 lowercase letters, numbers, underscores, or "
+            "hyphens, and must start with a letter or number"
+        )
+    return value
+
+
+def runtime_paths(account: str) -> RuntimePaths:
+    """Build isolated runtime paths for one Yahoo account."""
+
+    account = validate_account_name(account)
+    return RuntimePaths(
+        account=account,
+        b2_config_path=B2_CONFIG_PATH,
+        yahoo_config_path=CONFIG_DIRECTORY / "accounts" / f"{account}.env",
+        database_path=STATE_DIRECTORY / "data" / f"{account}.sqlite3",
+        temp_directory=STATE_DIRECTORY / "tmp" / account,
+        b2_message_prefix=f"mail/{account}/messages",
+    )
+
+
 def initialize_database(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=30)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
+    journal_mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+    if str(journal_mode).lower() != "delete":
+        connection.close()
+        raise RuntimeError(f"Could not enable SQLite rollback journal for {path}")
     connection.execute("PRAGMA synchronous=FULL")
     connection.execute("PRAGMA foreign_keys=ON")
     connection.executescript(
@@ -155,8 +192,11 @@ def initialize_database(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def create_b2_client(config: dict[str, str]):
-    require_settings(config, ("B2_KEY_ID", "B2_APPLICATION_KEY", "B2_BUCKET"), B2_CONFIG_PATH)
+def create_b2_client(config: dict[str, str], source: Path):
+    # Keep the optional third-party dependency out of argument parsing and tests.
+    from b2sdk.v3 import AuthInfoCache, B2Api, InMemoryAccountInfo
+
+    require_settings(config, ("B2_KEY_ID", "B2_APPLICATION_KEY", "B2_BUCKET"), source)
     account_info = InMemoryAccountInfo()
     api = B2Api(account_info, cache=AuthInfoCache(account_info))
     api.authorize_account(
@@ -358,17 +398,19 @@ def safe_subject(subject: str) -> str:
     return (normalized or "no-subject")[:80]
 
 
-def make_object_name(metadata: MessageMetadata, sha256: str) -> str:
+def make_object_name(
+    metadata: MessageMetadata, sha256: str, message_prefix: str
+) -> str:
     value = metadata.internal_date.astimezone(timezone.utc)
     return (
-        f"mail/{value:%Y/%m/%d}/{value:%H%M%S}_"
+        f"{message_prefix}/{value:%Y/%m/%d}/{value:%H%M%S}_"
         f"{safe_subject(metadata.subject)}_{sha256}.eml"
     )
 
 
-def stage_message(raw_message: bytes, sha256: str) -> Path:
-    TEMP_DIRECTORY.mkdir(parents=True, exist_ok=True)
-    final_path = TEMP_DIRECTORY / f"{sha256}.eml"
+def stage_message(raw_message: bytes, sha256: str, temp_directory: Path) -> Path:
+    temp_directory.mkdir(parents=True, exist_ok=True)
+    final_path = temp_directory / f"{sha256}.eml"
 
     if final_path.exists():
         existing_hash = hashlib.sha256(final_path.read_bytes()).hexdigest()
@@ -376,7 +418,7 @@ def stage_message(raw_message: bytes, sha256: str) -> Path:
             raise RuntimeError(f"Temporary file hash mismatch: {final_path}")
         return final_path
 
-    partial_path = TEMP_DIRECTORY / f".{sha256}.{os.getpid()}.part"
+    partial_path = temp_directory / f".{sha256}.{os.getpid()}.part"
     descriptor = os.open(partial_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(descriptor, "wb") as handle:
@@ -452,6 +494,7 @@ def record_occurrence(
 def archive_message(
     database: sqlite3.Connection,
     bucket,
+    paths: RuntimePaths,
     mailbox: Mailbox,
     uidvalidity: int,
     uid: int,
@@ -469,8 +512,8 @@ def archive_message(
         LOG.info("Already archived: folder=%s uid=%s sha256=%s", mailbox.key, uid, sha256)
         return False
 
-    object_name = make_object_name(metadata, sha256)
-    staged_path = stage_message(raw_message, sha256)
+    object_name = make_object_name(metadata, sha256, paths.b2_message_prefix)
+    staged_path = stage_message(raw_message, sha256, paths.temp_directory)
     uploaded = upload_and_verify(bucket, staged_path, object_name, sha256)
 
     with database:
@@ -510,6 +553,7 @@ def archive_mailbox(
     client: imaplib.IMAP4_SSL,
     database: sqlite3.Connection,
     bucket,
+    paths: RuntimePaths,
     mailbox: Mailbox,
     remaining_limit: int | None,
 ) -> tuple[int, int]:
@@ -543,6 +587,7 @@ def archive_mailbox(
         if archive_message(
             database,
             bucket,
+            paths,
             mailbox,
             uidvalidity,
             uid,
@@ -564,6 +609,7 @@ def archive_cycle(
     client: imaplib.IMAP4_SSL,
     database: sqlite3.Connection,
     bucket,
+    paths: RuntimePaths,
     max_messages: int | None,
 ) -> tuple[int, int]:
     total_fetched = 0
@@ -578,7 +624,7 @@ def archive_cycle(
         if remaining is not None and remaining <= 0:
             break
         fetched, uploaded = archive_mailbox(
-            client, database, bucket, mailbox, remaining
+            client, database, bucket, paths, mailbox, remaining
         )
         total_fetched += fetched
         total_uploaded += uploaded
@@ -589,8 +635,8 @@ def archive_cycle(
     return total_fetched, total_uploaded
 
 
-def connect_yahoo(config: dict[str, str]) -> imaplib.IMAP4_SSL:
-    require_settings(config, ("YAHOO_USERNAME", "YAHOO_APP_PASSWORD"), YAHOO_CONFIG_PATH)
+def connect_yahoo(config: dict[str, str], source: Path) -> imaplib.IMAP4_SSL:
+    require_settings(config, ("YAHOO_USERNAME", "YAHOO_APP_PASSWORD"), source)
     context = ssl.create_default_context()
     client = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=context, timeout=60)
     password = config["YAHOO_APP_PASSWORD"].replace(" ", "")
@@ -627,6 +673,12 @@ def wait_interruptibly(seconds: int) -> None:
 
 def parse_arguments(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Archive Yahoo IMAP mail to Backblaze B2")
+    parser.add_argument(
+        "--account",
+        required=True,
+        type=validate_account_name,
+        help="short account ID used for isolated config, state, and B2 paths",
+    )
     parser.add_argument("--once", action="store_true", help="run one scan and exit")
     parser.add_argument(
         "--max-messages",
@@ -643,8 +695,9 @@ def parse_arguments(argv: list[str]) -> argparse.Namespace:
 
 def run(argv: list[str]) -> int:
     args = parse_arguments(argv)
-    b2_config = read_env(B2_CONFIG_PATH)
-    yahoo_config = read_env(YAHOO_CONFIG_PATH)
+    paths = runtime_paths(args.account)
+    b2_config = read_env(paths.b2_config_path)
+    yahoo_config = read_env(paths.yahoo_config_path)
     poll_seconds = parse_positive_int(
         yahoo_config.get("POLL_SECONDS"), DEFAULT_POLL_SECONDS, "POLL_SECONDS"
     )
@@ -652,15 +705,20 @@ def run(argv: list[str]) -> int:
         yahoo_config.get("RETRY_SECONDS"), DEFAULT_RETRY_SECONDS, "RETRY_SECONDS"
     )
 
-    database = initialize_database(DATABASE_PATH)
-    bucket = create_b2_client(b2_config)
-    LOG.info("B2 authorization succeeded for bucket %s", b2_config["B2_BUCKET"])
+    database = initialize_database(paths.database_path)
+    bucket = create_b2_client(b2_config, paths.b2_config_path)
+    LOG.info(
+        "B2 authorization succeeded: account=%s bucket=%s prefix=%s",
+        paths.account,
+        b2_config["B2_BUCKET"],
+        paths.b2_message_prefix,
+    )
 
     if args.once:
         client = None
         try:
-            client = connect_yahoo(yahoo_config)
-            archive_cycle(client, database, bucket, args.max_messages)
+            client = connect_yahoo(yahoo_config, paths.yahoo_config_path)
+            archive_cycle(client, database, bucket, paths, args.max_messages)
             return 0
         finally:
             close_imap(client)
@@ -669,9 +727,9 @@ def run(argv: list[str]) -> int:
     while not STOP_REQUESTED:
         client = None
         try:
-            client = connect_yahoo(yahoo_config)
+            client = connect_yahoo(yahoo_config, paths.yahoo_config_path)
             while not STOP_REQUESTED:
-                archive_cycle(client, database, bucket, None)
+                archive_cycle(client, database, bucket, paths, None)
                 wait_interruptibly(poll_seconds)
                 if not STOP_REQUESTED:
                     status, _data = client.noop()
