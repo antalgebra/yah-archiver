@@ -36,6 +36,9 @@ IMAP_HOST = "imap.mail.yahoo.com"
 IMAP_PORT = 993
 DEFAULT_POLL_SECONDS = 20
 DEFAULT_RETRY_SECONDS = 30
+DEFAULT_BACKFILL_BATCH_SIZE = 100
+FAILURE_RETRY_BATCH_SIZE = 25
+MAX_CONSECUTIVE_MESSAGE_FAILURES = 3
 
 LOG = logging.getLogger("yah-arch")
 STOP_REQUESTED = False
@@ -72,6 +75,28 @@ class RuntimePaths:
     database_path: Path
     temp_directory: Path
     b2_message_prefix: str
+
+
+@dataclass(frozen=True)
+class FolderState:
+    uidvalidity: int
+    live_cursor_uid: int
+    backfill_before_uid: int
+    backfill_complete: bool
+
+
+@dataclass(frozen=True)
+class MessageAttempt:
+    uploaded: bool
+    retryable_failure: bool
+
+
+class ImapCommandError(RuntimeError):
+    """An IMAP command failed in a way that requires reconnecting."""
+
+
+class CycleAbortError(RuntimeError):
+    """A systemic-looking failure should stop this cycle and retry later."""
 
 
 def utc_now() -> datetime:
@@ -185,11 +210,61 @@ def initialize_database(path: Path) -> sqlite3.Connection:
             folder TEXT PRIMARY KEY,
             uidvalidity INTEGER NOT NULL,
             last_uid INTEGER NOT NULL DEFAULT 0,
+            live_cursor_uid INTEGER NOT NULL DEFAULT 0,
+            backfill_before_uid INTEGER,
+            backfill_complete INTEGER NOT NULL DEFAULT 0,
             checked_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS message_failures (
+            folder TEXT NOT NULL,
+            uidvalidity INTEGER NOT NULL,
+            uid INTEGER NOT NULL,
+            failure_kind TEXT NOT NULL,
+            retryable INTEGER NOT NULL CHECK (retryable IN (0, 1)),
+            attempts INTEGER NOT NULL,
+            first_failed_at TEXT NOT NULL,
+            last_failed_at TEXT NOT NULL,
+            last_error TEXT NOT NULL,
+            PRIMARY KEY (folder, uidvalidity, uid)
+        );
+
+        CREATE INDEX IF NOT EXISTS message_failures_retry_idx
+            ON message_failures(folder, uidvalidity, retryable, last_failed_at);
         """
     )
+    migrate_folder_state(connection)
     return connection
+
+
+def migrate_folder_state(connection: sqlite3.Connection) -> None:
+    """Upgrade the pre-multi-cursor folder table without discarding audit data."""
+
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(folder_state)").fetchall()
+    }
+    additions = {
+        "live_cursor_uid": "INTEGER NOT NULL DEFAULT 0",
+        "backfill_before_uid": "INTEGER",
+        "backfill_complete": "INTEGER NOT NULL DEFAULT 0",
+    }
+    with connection:
+        for name, definition in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE folder_state ADD COLUMN {name} {definition}"
+                )
+
+        # The old scanner processed every visible UID through last_uid in order.
+        # Preserve that work as a completed historical backfill.
+        connection.execute(
+            "UPDATE folder_state "
+            "SET live_cursor_uid = last_uid, backfill_before_uid = 1, "
+            "backfill_complete = 1 "
+            "WHERE last_uid > 0 AND live_cursor_uid = 0 "
+            "AND backfill_before_uid IS NULL"
+        )
 
 
 def create_b2_client(config: dict[str, str], source: Path):
@@ -262,14 +337,14 @@ def list_selectable_mailboxes(client: imaplib.IMAP4_SSL) -> list[Mailbox]:
 
     def priority(mailbox: Mailbox) -> tuple[int, str]:
         upper_name = mailbox.key.upper()
-        if upper_name == "INBOX":
+        if "\\TRASH" in mailbox.flags or upper_name == "TRASH":
             rank = 0
-        elif "\\SENT" in mailbox.flags or upper_name in {"SENT", "SENT ITEMS"}:
+        elif upper_name == "INBOX":
             rank = 1
-        elif "\\TRASH" in mailbox.flags or upper_name == "TRASH":
-            rank = 3
-        else:
+        elif "\\SENT" in mailbox.flags or upper_name in {"SENT", "SENT ITEMS"}:
             rank = 2
+        else:
+            rank = 3
         return rank, upper_name
 
     return sorted(mailboxes, key=priority)
@@ -285,57 +360,104 @@ def selected_uidvalidity(client: imaplib.IMAP4_SSL) -> int:
     return int(value)
 
 
-def get_folder_state(
-    database: sqlite3.Connection, folder: str, uidvalidity: int
-) -> int:
+def ensure_folder_state(
+    database: sqlite3.Connection,
+    folder: str,
+    uidvalidity: int,
+    current_uids: list[int],
+) -> FolderState:
+    """Load folder progress, initializing a newest-first historical backfill."""
+
     row = database.execute(
-        "SELECT uidvalidity, last_uid FROM folder_state WHERE folder = ?", (folder,)
+        "SELECT uidvalidity, live_cursor_uid, backfill_before_uid, "
+        "backfill_complete FROM folder_state WHERE folder = ?",
+        (folder,),
     ).fetchone()
 
-    if row is None:
-        with database:
-            database.execute(
-                "INSERT INTO folder_state(folder, uidvalidity, last_uid, checked_at) "
-                "VALUES (?, ?, 0, ?)",
-                (folder, uidvalidity, iso_utc()),
-            )
-        return 0
+    needs_initialization = row is None or row["backfill_before_uid"] is None
+    uidvalidity_changed = row is not None and row["uidvalidity"] != uidvalidity
+    if not needs_initialization and not uidvalidity_changed:
+        return FolderState(
+            uidvalidity=int(row["uidvalidity"]),
+            live_cursor_uid=int(row["live_cursor_uid"]),
+            backfill_before_uid=int(row["backfill_before_uid"]),
+            backfill_complete=bool(row["backfill_complete"]),
+        )
 
-    if row["uidvalidity"] != uidvalidity:
+    high_uid = max(current_uids, default=0)
+    backfill_before_uid = high_uid + 1
+    backfill_complete = not current_uids
+
+    if uidvalidity_changed:
         LOG.warning(
-            "UIDVALIDITY changed for %s: %s -> %s; rescanning folder",
+            "UIDVALIDITY changed for %s: %s -> %s; starting a fresh rescan",
             folder,
             row["uidvalidity"],
             uidvalidity,
         )
-        with database:
-            database.execute(
-                "UPDATE folder_state SET uidvalidity = ?, last_uid = 0, checked_at = ? "
-                "WHERE folder = ?",
-                (uidvalidity, iso_utc(), folder),
-            )
-        return 0
 
-    return int(row["last_uid"])
+    with database:
+        database.execute(
+            "INSERT INTO folder_state("
+            "folder, uidvalidity, last_uid, live_cursor_uid, "
+            "backfill_before_uid, backfill_complete, checked_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(folder) DO UPDATE SET "
+            "uidvalidity = excluded.uidvalidity, "
+            "last_uid = excluded.last_uid, "
+            "live_cursor_uid = excluded.live_cursor_uid, "
+            "backfill_before_uid = excluded.backfill_before_uid, "
+            "backfill_complete = excluded.backfill_complete, "
+            "checked_at = excluded.checked_at",
+            (
+                folder,
+                uidvalidity,
+                high_uid,
+                high_uid,
+                backfill_before_uid,
+                int(backfill_complete),
+                iso_utc(),
+            ),
+        )
 
-
-def update_folder_state(
-    database: sqlite3.Connection, folder: str, uidvalidity: int, last_uid: int
-) -> None:
-    database.execute(
-        "UPDATE folder_state SET uidvalidity = ?, last_uid = ?, checked_at = ? "
-        "WHERE folder = ?",
-        (uidvalidity, last_uid, iso_utc(), folder),
+    return FolderState(
+        uidvalidity=uidvalidity,
+        live_cursor_uid=high_uid,
+        backfill_before_uid=backfill_before_uid,
+        backfill_complete=backfill_complete,
     )
 
 
-def search_new_uids(client: imaplib.IMAP4_SSL, last_uid: int) -> list[int]:
-    start_uid = last_uid + 1
-    status, data = client.uid("SEARCH", None, f"UID {start_uid}:*")
+def update_live_cursor(
+    database: sqlite3.Connection, folder: str, uidvalidity: int, uid: int
+) -> None:
+    database.execute(
+        "UPDATE folder_state SET last_uid = ?, live_cursor_uid = ? "
+        "WHERE folder = ? AND uidvalidity = ?",
+        (uid, uid, folder, uidvalidity),
+    )
+
+
+def update_backfill_cursor(
+    database: sqlite3.Connection,
+    folder: str,
+    uidvalidity: int,
+    before_uid: int,
+    complete: bool = False,
+) -> None:
+    database.execute(
+        "UPDATE folder_state SET backfill_before_uid = ?, backfill_complete = ? "
+        "WHERE folder = ? AND uidvalidity = ?",
+        (before_uid, int(complete), folder, uidvalidity),
+    )
+
+
+def search_all_uids(client: imaplib.IMAP4_SSL) -> list[int]:
+    status, data = client.uid("SEARCH", None, "ALL")
     if status != "OK" or data is None:
-        raise RuntimeError(f"IMAP UID SEARCH failed: {status}")
+        raise ImapCommandError(f"IMAP UID SEARCH failed: {status}")
     values = data[0].split() if data and isinstance(data[0], bytes) else []
-    return sorted(uid for uid in (int(value) for value in values) if uid > last_uid)
+    return sorted(int(value) for value in values)
 
 
 def fetch_raw_message(
@@ -343,7 +465,7 @@ def fetch_raw_message(
 ) -> tuple[bytes, bytes] | None:
     status, parts = client.uid("FETCH", str(uid), "(UID INTERNALDATE BODY.PEEK[])")
     if status != "OK" or parts is None:
-        raise RuntimeError(f"IMAP UID FETCH failed for UID {uid}: {status}")
+        raise ImapCommandError(f"IMAP UID FETCH failed for UID {uid}: {status}")
 
     for part in parts:
         if (
@@ -491,6 +613,66 @@ def record_occurrence(
     )
 
 
+def record_message_failure(
+    database: sqlite3.Connection,
+    folder: str,
+    uidvalidity: int,
+    uid: int,
+    failure_kind: str,
+    retryable: bool,
+    error: str,
+) -> None:
+    now = iso_utc()
+    bounded_error = " ".join(error.replace("\x00", "").split())[:1000]
+    database.execute(
+        "INSERT INTO message_failures("
+        "folder, uidvalidity, uid, failure_kind, retryable, attempts, "
+        "first_failed_at, last_failed_at, last_error"
+        ") VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?) "
+        "ON CONFLICT(folder, uidvalidity, uid) DO UPDATE SET "
+        "failure_kind = excluded.failure_kind, "
+        "retryable = excluded.retryable, "
+        "attempts = message_failures.attempts + 1, "
+        "last_failed_at = excluded.last_failed_at, "
+        "last_error = excluded.last_error",
+        (
+            folder,
+            uidvalidity,
+            uid,
+            failure_kind,
+            int(retryable),
+            now,
+            now,
+            bounded_error,
+        ),
+    )
+
+
+def clear_message_failure(
+    database: sqlite3.Connection, folder: str, uidvalidity: int, uid: int
+) -> None:
+    database.execute(
+        "DELETE FROM message_failures "
+        "WHERE folder = ? AND uidvalidity = ? AND uid = ?",
+        (folder, uidvalidity, uid),
+    )
+
+
+def retryable_failure_uids(
+    database: sqlite3.Connection,
+    folder: str,
+    uidvalidity: int,
+    limit: int,
+) -> list[int]:
+    rows = database.execute(
+        "SELECT uid FROM message_failures "
+        "WHERE folder = ? AND uidvalidity = ? AND retryable = 1 "
+        "ORDER BY last_failed_at, uid LIMIT ?",
+        (folder, uidvalidity, limit),
+    ).fetchall()
+    return [int(row["uid"]) for row in rows]
+
+
 def archive_message(
     database: sqlite3.Connection,
     bucket,
@@ -508,7 +690,6 @@ def archive_message(
     if existing is not None:
         with database:
             record_occurrence(database, mailbox.key, uidvalidity, uid, sha256, metadata)
-            update_folder_state(database, mailbox.key, uidvalidity, uid)
         LOG.info("Already archived: folder=%s uid=%s sha256=%s", mailbox.key, uid, sha256)
         return False
 
@@ -531,7 +712,6 @@ def archive_message(
             ),
         )
         record_occurrence(database, mailbox.key, uidvalidity, uid, sha256, metadata)
-        update_folder_state(database, mailbox.key, uidvalidity, uid)
 
     try:
         staged_path.unlink()
@@ -549,42 +729,42 @@ def archive_message(
     return True
 
 
-def archive_mailbox(
+def attempt_message(
     client: imaplib.IMAP4_SSL,
     database: sqlite3.Connection,
     bucket,
     paths: RuntimePaths,
     mailbox: Mailbox,
-    remaining_limit: int | None,
-) -> tuple[int, int]:
-    status, _data = client.select(mailbox.select_argument, readonly=True)
-    if status != "OK":
-        raise RuntimeError(f"IMAP read-only SELECT failed for {mailbox.key}: {status}")
+    uidvalidity: int,
+    uid: int,
+) -> MessageAttempt:
+    """Attempt one message without letting a poison message block later UIDs."""
 
-    uidvalidity = selected_uidvalidity(client)
-    last_uid = get_folder_state(database, mailbox.key, uidvalidity)
-    uids = search_new_uids(client, last_uid)
-    fetched = 0
-    uploaded = 0
-
-    for uid in uids:
-        if STOP_REQUESTED or (remaining_limit is not None and fetched >= remaining_limit):
-            break
-
+    try:
         fetched_message = fetch_raw_message(client, uid)
         if fetched_message is None:
-            LOG.warning(
-                "Message disappeared before fetch: folder=%s uid=%s", mailbox.key, uid
-            )
             with database:
-                update_folder_state(database, mailbox.key, uidvalidity, uid)
-            continue
+                record_message_failure(
+                    database,
+                    mailbox.key,
+                    uidvalidity,
+                    uid,
+                    "disappeared_before_fetch",
+                    False,
+                    "UID was visible in SEARCH but absent during FETCH",
+                )
+            LOG.warning(
+                "Message disappeared before fetch: folder=%s uid=%s",
+                mailbox.key,
+                uid,
+            )
+            return MessageAttempt(uploaded=False, retryable_failure=False)
 
         fetch_metadata, raw_message = fetched_message
         if not raw_message:
-            raise RuntimeError(f"Yahoo returned an empty message for {mailbox.key} UID {uid}")
+            raise ValueError("Yahoo returned an empty RFC822 message")
 
-        if archive_message(
+        uploaded = archive_message(
             database,
             bucket,
             paths,
@@ -593,16 +773,170 @@ def archive_mailbox(
             uid,
             fetch_metadata,
             raw_message,
+        )
+        with database:
+            clear_message_failure(database, mailbox.key, uidvalidity, uid)
+        return MessageAttempt(uploaded=uploaded, retryable_failure=False)
+    except (ImapCommandError, imaplib.IMAP4.abort, ssl.SSLError, OSError):
+        raise
+    except Exception as error:
+        with database:
+            record_message_failure(
+                database,
+                mailbox.key,
+                uidvalidity,
+                uid,
+                "archive_error",
+                True,
+                f"{type(error).__name__}: {error}",
+            )
+        LOG.exception(
+            "Message archive failed but later UIDs may continue: folder=%s uid=%s",
+            mailbox.key,
+            uid,
+        )
+        return MessageAttempt(uploaded=False, retryable_failure=True)
+
+
+def archive_mailbox(
+    client: imaplib.IMAP4_SSL,
+    database: sqlite3.Connection,
+    bucket,
+    paths: RuntimePaths,
+    mailbox: Mailbox,
+    remaining_limit: int | None,
+    backfill_batch_size: int,
+) -> tuple[int, int]:
+    status, _data = client.select(mailbox.select_argument, readonly=True)
+    if status != "OK":
+        raise RuntimeError(f"IMAP read-only SELECT failed for {mailbox.key}: {status}")
+
+    uidvalidity = selected_uidvalidity(client)
+    current_uids = search_all_uids(client)
+    state = ensure_folder_state(database, mailbox.key, uidvalidity, current_uids)
+    attempted = 0
+    uploaded = 0
+    consecutive_failures = 0
+    attempted_uids: set[int] = set()
+
+    def at_limit() -> bool:
+        return remaining_limit is not None and attempted >= remaining_limit
+
+    def note_attempt(uid: int, result: MessageAttempt) -> None:
+        nonlocal attempted, uploaded, consecutive_failures
+        attempted += 1
+        attempted_uids.add(uid)
+        uploaded += int(result.uploaded)
+        if result.retryable_failure:
+            consecutive_failures += 1
+        else:
+            consecutive_failures = 0
+        if consecutive_failures >= MAX_CONSECUTIVE_MESSAGE_FAILURES:
+            raise CycleAbortError(
+                f"Stopping after {consecutive_failures} consecutive message failures"
+            )
+
+    # New arrivals are handled before retries and historical catch-up. Ascending
+    # order lets the live cursor move safely after each durable attempt.
+    live_uids = [uid for uid in current_uids if uid > state.live_cursor_uid]
+    for uid in live_uids:
+        if STOP_REQUESTED or at_limit():
+            break
+        result = attempt_message(
+            client,
+            database,
+            bucket,
+            paths,
+            mailbox,
+            uidvalidity,
+            uid,
+        )
+        with database:
+            update_live_cursor(database, mailbox.key, uidvalidity, uid)
+        note_attempt(uid, result)
+
+    # Existing mail is caught up newest first in bounded batches so every
+    # high-risk folder gets attention during the first cycles.
+    backfill_before_uid = state.backfill_before_uid
+    if not state.backfill_complete and not STOP_REQUESTED and not at_limit():
+        backfill_uids = [
+            uid for uid in reversed(current_uids) if uid < backfill_before_uid
+        ][:backfill_batch_size]
+        for uid in backfill_uids:
+            if STOP_REQUESTED or at_limit():
+                break
+            if uid in attempted_uids:
+                backfill_before_uid = uid
+                with database:
+                    update_backfill_cursor(
+                        database,
+                        mailbox.key,
+                        uidvalidity,
+                        backfill_before_uid,
+                    )
+                continue
+            result = attempt_message(
+                client,
+                database,
+                bucket,
+                paths,
+                mailbox,
+                uidvalidity,
+                uid,
+            )
+            backfill_before_uid = uid
+            with database:
+                update_backfill_cursor(
+                    database,
+                    mailbox.key,
+                    uidvalidity,
+                    backfill_before_uid,
+                )
+            note_attempt(uid, result)
+
+        if not STOP_REQUESTED and not any(
+            uid < backfill_before_uid for uid in current_uids
         ):
-            uploaded += 1
-        fetched += 1
+            with database:
+                update_backfill_cursor(
+                    database,
+                    mailbox.key,
+                    uidvalidity,
+                    backfill_before_uid,
+                    complete=True,
+                )
+
+    # Retry a bounded number of earlier message-specific failures after live
+    # mail and backfill. Poison retries therefore cannot starve untried UIDs.
+    if not STOP_REQUESTED and not at_limit():
+        retry_limit = FAILURE_RETRY_BATCH_SIZE
+        if remaining_limit is not None:
+            retry_limit = min(retry_limit, remaining_limit - attempted)
+        retry_uids = retryable_failure_uids(
+            database, mailbox.key, uidvalidity, retry_limit
+        )
+        for uid in retry_uids:
+            if STOP_REQUESTED or at_limit():
+                break
+            if uid in attempted_uids:
+                continue
+            result = attempt_message(
+                client,
+                database,
+                bucket,
+                paths,
+                mailbox,
+                uidvalidity,
+                uid,
+            )
+            note_attempt(uid, result)
 
     with database:
         database.execute(
             "UPDATE folder_state SET checked_at = ? WHERE folder = ?",
             (iso_utc(), mailbox.key),
         )
-    return fetched, uploaded
+    return attempted, uploaded
 
 
 def archive_cycle(
@@ -611,8 +945,9 @@ def archive_cycle(
     bucket,
     paths: RuntimePaths,
     max_messages: int | None,
+    backfill_batch_size: int,
 ) -> tuple[int, int]:
-    total_fetched = 0
+    total_attempted = 0
     total_uploaded = 0
     mailboxes = list_selectable_mailboxes(client)
     LOG.info("Scanning %s selectable Yahoo folders", len(mailboxes))
@@ -620,19 +955,33 @@ def archive_cycle(
     for mailbox in mailboxes:
         if STOP_REQUESTED:
             break
-        remaining = None if max_messages is None else max_messages - total_fetched
+        remaining = None if max_messages is None else max_messages - total_attempted
         if remaining is not None and remaining <= 0:
             break
-        fetched, uploaded = archive_mailbox(
-            client, database, bucket, paths, mailbox, remaining
-        )
-        total_fetched += fetched
+        try:
+            attempted, uploaded = archive_mailbox(
+                client,
+                database,
+                bucket,
+                paths,
+                mailbox,
+                remaining,
+                backfill_batch_size,
+            )
+        except (CycleAbortError, ImapCommandError, imaplib.IMAP4.abort, OSError):
+            raise
+        except Exception:
+            LOG.exception("Folder scan failed; continuing with other folders: %s", mailbox.key)
+            continue
+        total_attempted += attempted
         total_uploaded += uploaded
 
     LOG.info(
-        "Scan complete: fetched=%s newly-uploaded=%s", total_fetched, total_uploaded
+        "Scan complete: attempted=%s newly-uploaded=%s",
+        total_attempted,
+        total_uploaded,
     )
-    return total_fetched, total_uploaded
+    return total_attempted, total_uploaded
 
 
 def connect_yahoo(config: dict[str, str], source: Path) -> imaplib.IMAP4_SSL:
@@ -683,7 +1032,7 @@ def parse_arguments(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--max-messages",
         type=int,
-        help="fetch at most this many messages during the scan (for testing)",
+        help="attempt at most this many messages during the scan (for testing)",
     )
     args = parser.parse_args(argv)
     if args.max_messages is not None and args.max_messages < 1:
@@ -704,6 +1053,11 @@ def run(argv: list[str]) -> int:
     retry_seconds = parse_positive_int(
         yahoo_config.get("RETRY_SECONDS"), DEFAULT_RETRY_SECONDS, "RETRY_SECONDS"
     )
+    backfill_batch_size = parse_positive_int(
+        yahoo_config.get("BACKFILL_BATCH_SIZE"),
+        DEFAULT_BACKFILL_BATCH_SIZE,
+        "BACKFILL_BATCH_SIZE",
+    )
 
     database = initialize_database(paths.database_path)
     bucket = create_b2_client(b2_config, paths.b2_config_path)
@@ -718,7 +1072,14 @@ def run(argv: list[str]) -> int:
         client = None
         try:
             client = connect_yahoo(yahoo_config, paths.yahoo_config_path)
-            archive_cycle(client, database, bucket, paths, args.max_messages)
+            archive_cycle(
+                client,
+                database,
+                bucket,
+                paths,
+                args.max_messages,
+                backfill_batch_size,
+            )
             return 0
         finally:
             close_imap(client)
@@ -729,7 +1090,14 @@ def run(argv: list[str]) -> int:
         try:
             client = connect_yahoo(yahoo_config, paths.yahoo_config_path)
             while not STOP_REQUESTED:
-                archive_cycle(client, database, bucket, paths, None)
+                archive_cycle(
+                    client,
+                    database,
+                    bucket,
+                    paths,
+                    None,
+                    backfill_batch_size,
+                )
                 wait_interruptibly(poll_seconds)
                 if not STOP_REQUESTED:
                     status, _data = client.noop()

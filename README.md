@@ -28,7 +28,21 @@ mirror; a separate `yah-archive-crawler` project will provide read-only analysis
 
 This remains a best-effort IMAP archive: no poller can recover a message that is
 permanently deleted before its first successful fetch. Do not connect production
-Yahoo accounts until the initial-backfill and failure-isolation work is complete.
+Yahoo accounts until deletion-evidence and alerting work is complete.
+
+## Catch-up behavior
+
+- Trash is scanned first, followed by Inbox, Sent, and other folders.
+- On the first scan of a folder, existing messages are archived newest first.
+- Historical catch-up is limited to `BACKFILL_BATCH_SIZE` messages per folder per
+  cycle (default `100`), so one large folder cannot starve the other folders.
+- New messages are always attempted before historical catch-up.
+- A message-specific parse or upload failure is written to `message_failures` and
+  does not block later UIDs. Failed messages are retried in bounded batches.
+- Three consecutive message failures stop the cycle and trigger the normal retry
+  delay, preventing a broad outage from creating an unbounded failure queue.
+- An IMAP UID visible during `SEARCH` but gone before `FETCH` is retained as a
+  non-retryable `disappeared_before_fetch` record. Alerting comes in a later PR.
 
 ## Multi-account layout
 
@@ -82,8 +96,7 @@ The future controlled live test for one account will be:
 ```
 
 Do not run that live test until its Yahoo credential file exists with restricted
-permissions and the production-readiness checkpoints above are complete.
+permissions and the deletion-evidence and alerting checkpoints are complete.
 
 The service template is [`deploy/yah-arch@.service`](deploy/yah-arch@.service).
 It is committed for review but should not be installed or enabled yet.
-
