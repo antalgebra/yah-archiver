@@ -12,6 +12,7 @@ import argparse
 import email.policy
 import hashlib
 import imaplib
+import json
 import logging
 import os
 import re
@@ -75,6 +76,7 @@ class RuntimePaths:
     database_path: Path
     temp_directory: Path
     b2_message_prefix: str
+    b2_event_prefix: str
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,16 @@ class FolderState:
 class MessageAttempt:
     uploaded: bool
     retryable_failure: bool
+
+
+@dataclass(frozen=True)
+class MailboxScan:
+    attempted: int
+    uploaded: int
+    folder: str
+    uidvalidity: int
+    current_uids: tuple[int, ...]
+    is_trash: bool
 
 
 class ImapCommandError(RuntimeError):
@@ -164,6 +176,7 @@ def runtime_paths(account: str) -> RuntimePaths:
         database_path=STATE_DIRECTORY / "data" / f"{account}.sqlite3",
         temp_directory=STATE_DIRECTORY / "tmp" / account,
         b2_message_prefix=f"mail/{account}/messages",
+        b2_event_prefix=f"mail/{account}/events",
     )
 
 
@@ -231,6 +244,60 @@ def initialize_database(path: Path) -> sqlite3.Connection:
 
         CREATE INDEX IF NOT EXISTS message_failures_retry_idx
             ON message_failures(folder, uidvalidity, retryable, last_failed_at);
+
+        CREATE TABLE IF NOT EXISTS presence_folders (
+            folder TEXT PRIMARY KEY,
+            uidvalidity INTEGER NOT NULL,
+            is_trash INTEGER NOT NULL CHECK (is_trash IN (0, 1)),
+            present INTEGER NOT NULL CHECK (present IN (0, 1)),
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            missing_clean_scans INTEGER NOT NULL DEFAULT 0,
+            disappeared_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS message_presence (
+            folder TEXT NOT NULL,
+            uidvalidity INTEGER NOT NULL,
+            uid INTEGER NOT NULL,
+            sha256 TEXT,
+            is_trash INTEGER NOT NULL CHECK (is_trash IN (0, 1)),
+            present INTEGER NOT NULL CHECK (present IN (0, 1)),
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            missing_clean_scans INTEGER NOT NULL DEFAULT 0,
+            disappeared_at TEXT,
+            PRIMARY KEY (folder, uidvalidity, uid)
+        );
+
+        CREATE INDEX IF NOT EXISTS message_presence_sha_idx
+            ON message_presence(sha256, present);
+
+        CREATE TABLE IF NOT EXISTS audit_events (
+            event_key TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            folder TEXT,
+            uidvalidity INTEGER,
+            uid INTEGER,
+            sha256 TEXT,
+            details_json TEXT NOT NULL,
+            b2_object_name TEXT,
+            b2_file_id TEXT,
+            b2_uploaded_at TEXT,
+            upload_attempts INTEGER NOT NULL DEFAULT 0,
+            last_upload_error TEXT,
+            alerted_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS audit_events_pending_idx
+            ON audit_events(b2_uploaded_at, observed_at);
+
+        CREATE TABLE IF NOT EXISTS health_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """
     )
     migrate_folder_state(connection)
@@ -279,6 +346,68 @@ def create_b2_client(config: dict[str, str], source: Path):
         application_key=config["B2_APPLICATION_KEY"],
     )
     return api.get_bucket_by_name(config["B2_BUCKET"])
+
+
+def mailbox_is_trash(mailbox: Mailbox) -> bool:
+    upper_name = mailbox.key.upper()
+    return "\\TRASH" in mailbox.flags or upper_name == "TRASH"
+
+
+def health_value(database: sqlite3.Connection, key: str) -> str | None:
+    row = database.execute(
+        "SELECT value FROM health_state WHERE key = ?", (key,)
+    ).fetchone()
+    return None if row is None else str(row["value"])
+
+
+def set_health(database: sqlite3.Connection, key: str, value: str | None = None) -> None:
+    now = iso_utc()
+    database.execute(
+        "INSERT INTO health_state(key, value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+        "updated_at = excluded.updated_at",
+        (key, value or now, now),
+    )
+
+
+def record_audit_event(
+    database: sqlite3.Connection,
+    event_key: str,
+    event_type: str,
+    observed_at: str,
+    folder: str | None,
+    uidvalidity: int | None,
+    uid: int | None,
+    sha256: str | None,
+    details: dict,
+) -> None:
+    database.execute(
+        "INSERT OR IGNORE INTO audit_events("
+        "event_key, event_type, observed_at, folder, uidvalidity, uid, sha256, "
+        "details_json"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            event_key,
+            event_type,
+            observed_at,
+            folder,
+            uidvalidity,
+            uid,
+            sha256,
+            json.dumps(details, sort_keys=True, separators=(",", ":")),
+        ),
+    )
+
+
+def archived_message_sha256(
+    database: sqlite3.Connection, folder: str, uidvalidity: int, uid: int
+) -> str | None:
+    row = database.execute(
+        "SELECT sha256 FROM imap_messages "
+        "WHERE folder = ? AND uidvalidity = ? AND uid = ?",
+        (folder, uidvalidity, uid),
+    ).fetchone()
+    return None if row is None else str(row["sha256"])
 
 
 def unquote_imap_bytes(token: bytes) -> bytes:
@@ -337,7 +466,7 @@ def list_selectable_mailboxes(client: imaplib.IMAP4_SSL) -> list[Mailbox]:
 
     def priority(mailbox: Mailbox) -> tuple[int, str]:
         upper_name = mailbox.key.upper()
-        if "\\TRASH" in mailbox.flags or upper_name == "TRASH":
+        if mailbox_is_trash(mailbox):
             rank = 0
         elif upper_name == "INBOX":
             rank = 1
@@ -712,6 +841,7 @@ def archive_message(
             ),
         )
         record_occurrence(database, mailbox.key, uidvalidity, uid, sha256, metadata)
+        set_health(database, "last_successful_b2_upload")
 
     try:
         staged_path.unlink()
@@ -743,6 +873,7 @@ def attempt_message(
     try:
         fetched_message = fetch_raw_message(client, uid)
         if fetched_message is None:
+            observed_at = iso_utc()
             with database:
                 record_message_failure(
                     database,
@@ -752,6 +883,25 @@ def attempt_message(
                     "disappeared_before_fetch",
                     False,
                     "UID was visible in SEARCH but absent during FETCH",
+                )
+                record_audit_event(
+                    database,
+                    f"message_disappeared_before_fetch:{mailbox.key}:"
+                    f"{uidvalidity}:{uid}",
+                    "message_disappeared_before_fetch",
+                    observed_at,
+                    mailbox.key,
+                    uidvalidity,
+                    uid,
+                    None,
+                    {
+                        "account": paths.account,
+                        "meaning": (
+                            "The UID was visible during SEARCH but its RFC822 "
+                            "content was unavailable during FETCH. Cause and actor "
+                            "cannot be determined from IMAP."
+                        ),
+                    },
                 )
             LOG.warning(
                 "Message disappeared before fetch: folder=%s uid=%s",
@@ -806,6 +956,7 @@ def archive_mailbox(
     mailbox: Mailbox,
     remaining_limit: int | None,
     backfill_batch_size: int,
+    presence_scans: list[MailboxScan] | None = None,
 ) -> tuple[int, int]:
     status, _data = client.select(mailbox.select_argument, readonly=True)
     if status != "OK":
@@ -936,7 +1087,382 @@ def archive_mailbox(
             "UPDATE folder_state SET checked_at = ? WHERE folder = ?",
             (iso_utc(), mailbox.key),
         )
+    if presence_scans is not None:
+        presence_scans.append(
+            MailboxScan(
+                attempted=attempted,
+                uploaded=uploaded,
+                folder=mailbox.key,
+                uidvalidity=uidvalidity,
+                current_uids=tuple(current_uids),
+                is_trash=mailbox_is_trash(mailbox),
+            )
+        )
     return attempted, uploaded
+
+
+def reconcile_presence(
+    database: sqlite3.Connection,
+    paths: RuntimePaths,
+    scans: list[MailboxScan],
+) -> None:
+    """Reconcile one complete IMAP snapshot and create neutral audit events."""
+
+    observed_at = iso_utc()
+    baseline_exists = health_value(database, "presence_baseline_complete") == "1"
+    observed_folders = {scan.folder for scan in scans}
+    reset_folders: set[str] = set()
+
+    with database:
+        previous_folders = {
+            str(row["folder"]): row
+            for row in database.execute(
+                "SELECT * FROM presence_folders"
+            ).fetchall()
+        }
+
+        for scan in scans:
+            previous = previous_folders.get(scan.folder)
+            if previous is None or int(previous["uidvalidity"]) != scan.uidvalidity:
+                reset_folders.add(scan.folder)
+
+            if (
+                baseline_exists
+                and previous is not None
+                and int(previous["uidvalidity"]) != scan.uidvalidity
+            ):
+                old_uidvalidity = int(previous["uidvalidity"])
+                record_audit_event(
+                    database,
+                    f"uidvalidity_changed:{scan.folder}:{old_uidvalidity}:"
+                    f"{scan.uidvalidity}",
+                    "uidvalidity_changed",
+                    observed_at,
+                    scan.folder,
+                    scan.uidvalidity,
+                    None,
+                    None,
+                    {
+                        "account": paths.account,
+                        "old_uidvalidity": old_uidvalidity,
+                        "new_uidvalidity": scan.uidvalidity,
+                        "meaning": (
+                            "The folder UID namespace changed. Per-message "
+                            "deletion conclusions were suppressed for this reset."
+                        ),
+                    },
+                )
+                database.execute(
+                    "UPDATE message_presence SET present = 0, disappeared_at = ? "
+                    "WHERE folder = ? AND uidvalidity = ? AND present = 1",
+                    (observed_at, scan.folder, old_uidvalidity),
+                )
+
+            database.execute(
+                "INSERT INTO presence_folders("
+                "folder, uidvalidity, is_trash, present, first_seen_at, "
+                "last_seen_at, missing_clean_scans, disappeared_at"
+                ") VALUES (?, ?, ?, 1, ?, ?, 0, NULL) "
+                "ON CONFLICT(folder) DO UPDATE SET "
+                "uidvalidity = excluded.uidvalidity, "
+                "is_trash = excluded.is_trash, present = 1, "
+                "last_seen_at = excluded.last_seen_at, "
+                "missing_clean_scans = 0, disappeared_at = NULL",
+                (
+                    scan.folder,
+                    scan.uidvalidity,
+                    int(scan.is_trash),
+                    observed_at,
+                    observed_at,
+                ),
+            )
+
+        for folder, previous in previous_folders.items():
+            if folder in observed_folders or not bool(previous["present"]):
+                continue
+            missing_scans = int(previous["missing_clean_scans"]) + 1
+            if missing_scans < 2:
+                database.execute(
+                    "UPDATE presence_folders SET missing_clean_scans = ? "
+                    "WHERE folder = ?",
+                    (missing_scans, folder),
+                )
+                continue
+
+            database.execute(
+                "UPDATE presence_folders SET present = 0, "
+                "missing_clean_scans = ?, disappeared_at = ? WHERE folder = ?",
+                (missing_scans, observed_at, folder),
+            )
+            database.execute(
+                "UPDATE message_presence SET present = 0, disappeared_at = ? "
+                "WHERE folder = ? AND present = 1",
+                (observed_at, folder),
+            )
+            if baseline_exists:
+                record_audit_event(
+                    database,
+                    f"folder_disappeared:{folder}:{previous['uidvalidity']}",
+                    "folder_disappeared",
+                    observed_at,
+                    folder,
+                    int(previous["uidvalidity"]),
+                    None,
+                    None,
+                    {
+                        "account": paths.account,
+                        "last_seen_at": str(previous["last_seen_at"]),
+                        "meaning": (
+                            "The folder was absent from two complete scans. "
+                            "Per-message deletion conclusions were suppressed."
+                        ),
+                    },
+                )
+
+        for scan in scans:
+            prior_messages = {
+                int(row["uid"]): row
+                for row in database.execute(
+                    "SELECT * FROM message_presence "
+                    "WHERE folder = ? AND uidvalidity = ?",
+                    (scan.folder, scan.uidvalidity),
+                ).fetchall()
+            }
+            for uid in scan.current_uids:
+                sha256 = archived_message_sha256(
+                    database, scan.folder, scan.uidvalidity, uid
+                )
+                previous = prior_messages.get(uid)
+                database.execute(
+                    "INSERT INTO message_presence("
+                    "folder, uidvalidity, uid, sha256, is_trash, present, "
+                    "first_seen_at, last_seen_at, missing_clean_scans, "
+                    "disappeared_at"
+                    ") VALUES (?, ?, ?, ?, ?, 1, ?, ?, 0, NULL) "
+                    "ON CONFLICT(folder, uidvalidity, uid) DO UPDATE SET "
+                    "sha256 = COALESCE(excluded.sha256, message_presence.sha256), "
+                    "is_trash = excluded.is_trash, present = 1, "
+                    "last_seen_at = excluded.last_seen_at, "
+                    "missing_clean_scans = 0, disappeared_at = NULL",
+                    (
+                        scan.folder,
+                        scan.uidvalidity,
+                        uid,
+                        sha256,
+                        int(scan.is_trash),
+                        observed_at,
+                        observed_at,
+                    ),
+                )
+                if (
+                    baseline_exists
+                    and previous is None
+                    and scan.is_trash
+                    and scan.folder not in reset_folders
+                ):
+                    record_audit_event(
+                        database,
+                        f"trash_observed:{scan.folder}:{scan.uidvalidity}:{uid}",
+                        "trash_observed",
+                        observed_at,
+                        scan.folder,
+                        scan.uidvalidity,
+                        uid,
+                        sha256,
+                        {
+                            "account": paths.account,
+                            "meaning": (
+                                "A UID appeared in Yahoo Trash after the baseline. "
+                                "This does not identify who moved it."
+                            ),
+                        },
+                    )
+
+        for scan in scans:
+            visible_uids = set(scan.current_uids)
+            missing_rows = database.execute(
+                "SELECT * FROM message_presence "
+                "WHERE folder = ? AND uidvalidity = ? AND present = 1",
+                (scan.folder, scan.uidvalidity),
+            ).fetchall()
+            for row in missing_rows:
+                uid = int(row["uid"])
+                if uid in visible_uids:
+                    continue
+                missing_scans = int(row["missing_clean_scans"]) + 1
+                if missing_scans < 2:
+                    database.execute(
+                        "UPDATE message_presence SET missing_clean_scans = ? "
+                        "WHERE folder = ? AND uidvalidity = ? AND uid = ?",
+                        (missing_scans, scan.folder, scan.uidvalidity, uid),
+                    )
+                    continue
+
+                database.execute(
+                    "UPDATE message_presence SET present = 0, "
+                    "missing_clean_scans = ?, disappeared_at = ? "
+                    "WHERE folder = ? AND uidvalidity = ? AND uid = ?",
+                    (
+                        missing_scans,
+                        observed_at,
+                        scan.folder,
+                        scan.uidvalidity,
+                        uid,
+                    ),
+                )
+                sha256 = None if row["sha256"] is None else str(row["sha256"])
+                if bool(row["is_trash"]):
+                    event_type = "trash_disappeared"
+                    meaning = (
+                        "The UID was absent from Yahoo Trash in two complete "
+                        "scans. This may be manual deletion or Yahoo retention; "
+                        "IMAP does not identify the actor."
+                    )
+                else:
+                    same_content_present = False
+                    if sha256:
+                        same_content_present = (
+                            database.execute(
+                                "SELECT 1 FROM message_presence "
+                                "WHERE sha256 = ? AND present = 1 LIMIT 1",
+                                (sha256,),
+                            ).fetchone()
+                            is not None
+                        )
+                    if same_content_present:
+                        continue
+                    event_type = "unexplained_disappearance"
+                    meaning = (
+                        "The UID was absent from its Yahoo folder in two complete "
+                        "scans and no archived copy was correlated in another "
+                        "current folder. Cause and actor cannot be determined."
+                    )
+
+                record_audit_event(
+                    database,
+                    f"{event_type}:{scan.folder}:{scan.uidvalidity}:{uid}",
+                    event_type,
+                    observed_at,
+                    scan.folder,
+                    scan.uidvalidity,
+                    uid,
+                    sha256,
+                    {
+                        "account": paths.account,
+                        "last_seen_at": str(row["last_seen_at"]),
+                        "confirmed_after_clean_scans": missing_scans,
+                        "meaning": meaning,
+                    },
+                )
+
+        set_health(database, "presence_baseline_complete", "1")
+        set_health(database, "last_successful_presence_scan", observed_at)
+
+
+def stage_audit_event(data: bytes, paths: RuntimePaths, event_key: str) -> Path:
+    event_directory = paths.temp_directory / "events"
+    event_directory.mkdir(parents=True, exist_ok=True)
+    name_digest = hashlib.sha256(event_key.encode("utf-8")).hexdigest()
+    final_path = event_directory / f"{name_digest}.json"
+    partial_path = event_directory / f".{name_digest}.{os.getpid()}.part"
+    descriptor = os.open(partial_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(partial_path, final_path)
+    except Exception:
+        try:
+            partial_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return final_path
+
+
+def upload_pending_audit_events(
+    database: sqlite3.Connection,
+    bucket,
+    paths: RuntimePaths,
+    limit: int = 100,
+) -> None:
+    rows = database.execute(
+        "SELECT * FROM audit_events WHERE b2_uploaded_at IS NULL "
+        "ORDER BY observed_at, event_key LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+    for row in rows:
+        event_key = str(row["event_key"])
+        event_type = str(row["event_type"])
+        observed_at = str(row["observed_at"])
+        payload = {
+            "schema_version": 1,
+            "account": paths.account,
+            "event_key": event_key,
+            "event_type": event_type,
+            "observed_at": observed_at,
+            "folder": row["folder"],
+            "uidvalidity": row["uidvalidity"],
+            "uid": row["uid"],
+            "sha256": row["sha256"],
+            "details": json.loads(str(row["details_json"])),
+        }
+        data = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
+        value = datetime.fromisoformat(observed_at).astimezone(timezone.utc)
+        name_digest = hashlib.sha256(event_key.encode("utf-8")).hexdigest()[:16]
+        safe_type = re.sub(r"[^a-z0-9_-]+", "-", event_type.lower())
+        object_name = (
+            f"{paths.b2_event_prefix}/{value:%Y/%m/%d}/"
+            f"{value:%H%M%S}_{safe_type}_{name_digest}.json"
+        )
+        raw_sha1 = hashlib.sha1(data, usedforsecurity=False).hexdigest()
+        payload_sha256 = hashlib.sha256(data).hexdigest()
+
+        try:
+            staged_path = stage_audit_event(data, paths, event_key)
+            uploaded = bucket.upload_local_file(
+                str(staged_path),
+                object_name,
+                content_type="application/json",
+                file_info={
+                    "sha256": payload_sha256,
+                    "eventType": event_type,
+                },
+                sha1_sum=raw_sha1,
+            )
+            if uploaded.content_sha1 != raw_sha1:
+                raise RuntimeError("B2 audit-event SHA-1 verification failed")
+            if uploaded.file_name != object_name or uploaded.size != len(data):
+                raise RuntimeError("B2 returned unexpected audit-event metadata")
+            if uploaded.file_info.get("sha256") != payload_sha256:
+                raise RuntimeError("B2 returned unexpected audit-event SHA-256")
+
+            with database:
+                database.execute(
+                    "UPDATE audit_events SET b2_object_name = ?, b2_file_id = ?, "
+                    "b2_uploaded_at = ?, upload_attempts = upload_attempts + 1, "
+                    "last_upload_error = NULL WHERE event_key = ?",
+                    (object_name, uploaded.id_, iso_utc(), event_key),
+                )
+                set_health(database, "last_deletion_event_upload")
+            try:
+                staged_path.unlink()
+            except OSError:
+                LOG.warning("Could not remove uploaded audit-event file: %s", staged_path)
+        except Exception as error:
+            with database:
+                database.execute(
+                    "UPDATE audit_events SET upload_attempts = upload_attempts + 1, "
+                    "last_upload_error = ? WHERE event_key = ?",
+                    (
+                        f"{type(error).__name__}: {error}"[:1000],
+                        event_key,
+                    ),
+                )
+            LOG.exception("Audit-event B2 upload failed; message archiving remains active")
+            break
 
 
 def archive_cycle(
@@ -949,14 +1475,18 @@ def archive_cycle(
 ) -> tuple[int, int]:
     total_attempted = 0
     total_uploaded = 0
+    presence_scans: list[MailboxScan] = []
+    complete_scan = max_messages is None
     mailboxes = list_selectable_mailboxes(client)
     LOG.info("Scanning %s selectable Yahoo folders", len(mailboxes))
 
     for mailbox in mailboxes:
         if STOP_REQUESTED:
+            complete_scan = False
             break
         remaining = None if max_messages is None else max_messages - total_attempted
         if remaining is not None and remaining <= 0:
+            complete_scan = False
             break
         try:
             attempted, uploaded = archive_mailbox(
@@ -967,10 +1497,12 @@ def archive_cycle(
                 mailbox,
                 remaining,
                 backfill_batch_size,
+                presence_scans,
             )
         except (CycleAbortError, ImapCommandError, imaplib.IMAP4.abort, OSError):
             raise
         except Exception:
+            complete_scan = False
             LOG.exception("Folder scan failed; continuing with other folders: %s", mailbox.key)
             continue
         total_attempted += attempted
@@ -981,6 +1513,25 @@ def archive_cycle(
         total_attempted,
         total_uploaded,
     )
+
+    if len(presence_scans) != len(mailboxes):
+        complete_scan = False
+
+    if complete_scan and not STOP_REQUESTED:
+        with database:
+            set_health(database, "last_successful_archive_cycle")
+        try:
+            reconcile_presence(database, paths, presence_scans)
+        except Exception:
+            LOG.exception(
+                "Presence reconciliation failed; message archiving remains active"
+            )
+
+    try:
+        upload_pending_audit_events(database, bucket, paths)
+    except Exception:
+        LOG.exception("Audit-event processing failed; message archiving remains active")
+
     return total_attempted, total_uploaded
 
 
