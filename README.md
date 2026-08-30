@@ -10,7 +10,8 @@ This repository owns two related guarantees:
 
 Deletion evidence shares the collector's coherent IMAP scan but has separate
 state and health timestamps. Evidence is stored in SQLite and copied to the
-Object-Locked B2 bucket. Notification delivery is configured separately. A
+Object-Locked B2 bucket. After that upload succeeds, a generic Pushover alert is
+sent without exposing message subjects or bodies. A
 later `yah-archive-ops` project will provide B2 verification and a copy-only
 OneDrive mirror; `yah-archive-crawler` will provide read-only analysis.
 
@@ -64,6 +65,8 @@ Yahoo accounts until deletion-evidence and alerting work is complete.
   the bucket's default Object Lock retention.
 - Event-upload or reconciliation errors never cause archived messages to be
   removed or changed.
+- Alerts are normal-priority Pushover notifications and are retried after
+  delivery failures. Archiving continues while Pushover is unavailable.
 
 ## Multi-account layout
 
@@ -73,6 +76,7 @@ For an account ID such as `personal`:
 |---|---|
 | Shared B2 credentials | `/etc/yah-arch/b2.env` |
 | Yahoo credentials | `/etc/yah-arch/accounts/personal.env` |
+| Shared Pushover credentials | `/etc/yah-arch/pushover.env` |
 | SQLite catalog | `/var/lib/yah-arch/data/personal.sqlite3` |
 | Temporary message staging | `/var/lib/yah-arch/tmp/personal/` |
 | B2 messages | `mail/personal/messages/...` |

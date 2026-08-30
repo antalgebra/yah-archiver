@@ -22,6 +22,8 @@ import ssl
 import sys
 import time
 import unicodedata
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.parser import BytesHeaderParser
@@ -40,6 +42,7 @@ DEFAULT_RETRY_SECONDS = 30
 DEFAULT_BACKFILL_BATCH_SIZE = 100
 FAILURE_RETRY_BATCH_SIZE = 25
 MAX_CONSECUTIVE_MESSAGE_FAILURES = 3
+PUSHOVER_MESSAGES_URL = "https://api.pushover.net/1/messages.json"
 
 LOG = logging.getLogger("yah-arch")
 STOP_REQUESTED = False
@@ -73,6 +76,7 @@ class RuntimePaths:
     account: str
     b2_config_path: Path
     yahoo_config_path: Path
+    pushover_config_path: Path
     database_path: Path
     temp_directory: Path
     b2_message_prefix: str
@@ -173,6 +177,7 @@ def runtime_paths(account: str) -> RuntimePaths:
         account=account,
         b2_config_path=B2_CONFIG_PATH,
         yahoo_config_path=CONFIG_DIRECTORY / "accounts" / f"{account}.env",
+        pushover_config_path=CONFIG_DIRECTORY / "pushover.env",
         database_path=STATE_DIRECTORY / "data" / f"{account}.sqlite3",
         temp_directory=STATE_DIRECTORY / "tmp" / account,
         b2_message_prefix=f"mail/{account}/messages",
@@ -287,6 +292,8 @@ def initialize_database(path: Path) -> sqlite3.Connection:
             b2_uploaded_at TEXT,
             upload_attempts INTEGER NOT NULL DEFAULT 0,
             last_upload_error TEXT,
+            alert_attempts INTEGER NOT NULL DEFAULT 0,
+            last_alert_error TEXT,
             alerted_at TEXT
         );
 
@@ -301,6 +308,7 @@ def initialize_database(path: Path) -> sqlite3.Connection:
         """
     )
     migrate_folder_state(connection)
+    migrate_audit_events(connection)
     return connection
 
 
@@ -332,6 +340,23 @@ def migrate_folder_state(connection: sqlite3.Connection) -> None:
             "WHERE last_uid > 0 AND live_cursor_uid = 0 "
             "AND backfill_before_uid IS NULL"
         )
+
+
+def migrate_audit_events(connection: sqlite3.Connection) -> None:
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(audit_events)").fetchall()
+    }
+    additions = {
+        "alert_attempts": "INTEGER NOT NULL DEFAULT 0",
+        "last_alert_error": "TEXT",
+    }
+    with connection:
+        for name, definition in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE audit_events ADD COLUMN {name} {definition}"
+                )
 
 
 def create_b2_client(config: dict[str, str], source: Path):
@@ -1465,11 +1490,108 @@ def upload_pending_audit_events(
             break
 
 
+def alert_text(event_type: str, folder: str | None, evidence_id: str) -> str:
+    messages = {
+        "trash_observed": "A message appeared in Yahoo Trash.",
+        "trash_disappeared": (
+            "A message disappeared from Yahoo Trash after two complete scans. "
+            "This may be manual deletion or Yahoo retention."
+        ),
+        "unexplained_disappearance": (
+            "A message disappeared from a Yahoo folder after two complete scans, "
+            "with no correlated current copy in another folder."
+        ),
+        "message_disappeared_before_fetch": (
+            "A Yahoo message disappeared between IMAP search and RFC822 fetch."
+        ),
+        "uidvalidity_changed": (
+            "Yahoo reset a folder's IMAP UID namespace. Message-level deletion "
+            "conclusions were suppressed for the reset."
+        ),
+        "folder_disappeared": (
+            "A Yahoo folder was absent from two complete scans. Message-level "
+            "deletion conclusions were suppressed."
+        ),
+    }
+    message = messages.get(event_type, f"Yahoo audit event: {event_type}.")
+    location = f" Folder: {folder}." if folder else ""
+    return f"{message}{location} Evidence: {evidence_id}."
+
+
+def send_pushover_message(
+    config: dict[str, str], title: str, message: str
+) -> None:
+    fields = {
+        "token": config["PUSHOVER_APP_TOKEN"],
+        "user": config["PUSHOVER_USER_KEY"],
+        "title": title[:250],
+        "message": message[:1024],
+        "priority": "0",
+    }
+    if config.get("PUSHOVER_DEVICE"):
+        fields["device"] = config["PUSHOVER_DEVICE"]
+    request = urllib.request.Request(
+        PUSHOVER_MESSAGES_URL,
+        data=urllib.parse.urlencode(fields).encode("utf-8"),
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "yah-archiver/1.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    if result.get("status") != 1:
+        raise RuntimeError("Pushover rejected the notification")
+
+
+def send_pending_alerts(
+    database: sqlite3.Connection,
+    paths: RuntimePaths,
+    pushover_config: dict[str, str],
+    limit: int = 50,
+) -> None:
+    rows = database.execute(
+        "SELECT event_key, event_type, folder FROM audit_events "
+        "WHERE b2_uploaded_at IS NOT NULL AND alerted_at IS NULL "
+        "ORDER BY observed_at, event_key LIMIT ?",
+        (limit,),
+    ).fetchall()
+    for row in rows:
+        event_key = str(row["event_key"])
+        event_type = str(row["event_type"])
+        evidence_id = hashlib.sha256(event_key.encode("utf-8")).hexdigest()[:12]
+        try:
+            send_pushover_message(
+                pushover_config,
+                f"Yahoo archive alert: {paths.account}",
+                alert_text(event_type, row["folder"], evidence_id),
+            )
+            with database:
+                database.execute(
+                    "UPDATE audit_events SET alerted_at = ?, "
+                    "alert_attempts = alert_attempts + 1, last_alert_error = NULL "
+                    "WHERE event_key = ?",
+                    (iso_utc(), event_key),
+                )
+                set_health(database, "last_successful_alert")
+        except Exception as error:
+            with database:
+                database.execute(
+                    "UPDATE audit_events SET alert_attempts = alert_attempts + 1, "
+                    "last_alert_error = ? WHERE event_key = ?",
+                    (f"{type(error).__name__}: {error}"[:1000], event_key),
+                )
+            LOG.exception("Pushover alert failed; message archiving remains active")
+            break
+
+
 def archive_cycle(
     client: imaplib.IMAP4_SSL,
     database: sqlite3.Connection,
     bucket,
     paths: RuntimePaths,
+    pushover_config: dict[str, str],
     max_messages: int | None,
     backfill_batch_size: int,
 ) -> tuple[int, int]:
@@ -1531,6 +1653,11 @@ def archive_cycle(
         upload_pending_audit_events(database, bucket, paths)
     except Exception:
         LOG.exception("Audit-event processing failed; message archiving remains active")
+
+    try:
+        send_pending_alerts(database, paths, pushover_config)
+    except Exception:
+        LOG.exception("Pushover processing failed; message archiving remains active")
 
     return total_attempted, total_uploaded
 
@@ -1598,6 +1725,12 @@ def run(argv: list[str]) -> int:
     paths = runtime_paths(args.account)
     b2_config = read_env(paths.b2_config_path)
     yahoo_config = read_env(paths.yahoo_config_path)
+    pushover_config = read_env(paths.pushover_config_path)
+    require_settings(
+        pushover_config,
+        ("PUSHOVER_APP_TOKEN", "PUSHOVER_USER_KEY"),
+        paths.pushover_config_path,
+    )
     poll_seconds = parse_positive_int(
         yahoo_config.get("POLL_SECONDS"), DEFAULT_POLL_SECONDS, "POLL_SECONDS"
     )
@@ -1628,6 +1761,7 @@ def run(argv: list[str]) -> int:
                 database,
                 bucket,
                 paths,
+                pushover_config,
                 args.max_messages,
                 backfill_batch_size,
             )
@@ -1646,6 +1780,7 @@ def run(argv: list[str]) -> int:
                     database,
                     bucket,
                     paths,
+                    pushover_config,
                     None,
                     backfill_batch_size,
                 )
