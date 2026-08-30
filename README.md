@@ -102,6 +102,25 @@ reference.
 - Python 3.12
 - `b2sdk` from `requirements.txt`
 
+## Add a Yahoo account
+
+After the one-time B2 and Pushover setup is complete, run the interactive
+wizard on the archive server:
+
+```bash
+sudo /opt/yah-arch/venv/bin/python /opt/yah-arch/src/onboard.py
+```
+
+The wizard asks for a short account ID, the Yahoo email address, and a Yahoo
+app password. Password input is hidden. It writes the account file atomically
+as `root:yaharch` with mode `0640`, installs the systemd service template, and
+offers to enable and start that account's always-on service. It never asks for
+the normal Yahoo password.
+
+Run the same command again for every additional account. Reusing an existing
+account ID requires explicit confirmation before its credentials are replaced.
+No credentials are written to this Git repository.
+
 Show the command interface:
 
 ```bash
