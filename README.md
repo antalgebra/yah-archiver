@@ -41,7 +41,9 @@ Yahoo accounts until deletion-evidence and alerting work is complete.
 - Trash is scanned first, followed by Inbox, Sent, and other folders.
 - On the first scan of a folder, existing messages are archived newest first.
 - Historical catch-up is limited to `BACKFILL_BATCH_SIZE` messages per folder per
-  cycle (default `100`), so one large folder cannot starve the other folders.
+  cycle (default `10`), so the service returns quickly to checking for new mail.
+- Completed scans repeat after `POLL_SECONDS` (default `5` seconds), prioritizing
+  rapid protection of ongoing mail over the speed of historical catch-up.
 - New messages are always attempted before historical catch-up.
 - A message-specific parse or upload failure is written to `message_failures` and
   does not block later UIDs. Failed messages are retried in bounded batches.
