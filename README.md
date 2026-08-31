@@ -27,6 +27,10 @@ OneDrive mirror; `yah-archive-crawler` will provide read-only analysis.
 - SHA-256 identifies message content; folder, UIDVALIDITY, and UID are retained
   for audit history.
 - Backblaze Object Lock supplies immutable retention independently of this code.
+- Deduplication performs one indexed SHA-256 lookup in the local SQLite catalog.
+  It does not list B2 objects or interpret old and new object-name layouts.
+- Upload verification calculates checksums from the message bytes already in
+  memory instead of rereading the staged file before each upload.
 
 This remains a best-effort IMAP archive: no poller can recover a message that is
 permanently deleted before its first successful fetch. Do not connect production

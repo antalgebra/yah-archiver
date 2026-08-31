@@ -715,16 +715,20 @@ def stage_message(raw_message: bytes, sha256: str, temp_directory: Path) -> Path
     return final_path
 
 
-def find_archived_object(database: sqlite3.Connection, sha256: str):
+def archived_object_exists(database: sqlite3.Connection, sha256: str) -> bool:
     return database.execute(
-        "SELECT object_name, b2_file_id, b2_sha1, size_bytes "
-        "FROM archive_objects WHERE sha256 = ?",
+        "SELECT 1 FROM archive_objects WHERE sha256 = ?",
         (sha256,),
-    ).fetchone()
+    ).fetchone() is not None
 
 
-def upload_and_verify(bucket, staged_path: Path, object_name: str, sha256: str):
-    raw_sha1 = hashlib.sha1(staged_path.read_bytes(), usedforsecurity=False).hexdigest()
+def upload_and_verify(
+    bucket,
+    staged_path: Path,
+    object_name: str,
+    sha256: str,
+    raw_sha1: str,
+):
     uploaded = bucket.upload_local_file(
         str(staged_path),
         object_name,
@@ -843,9 +847,8 @@ def archive_message(
 ) -> bool:
     sha256 = hashlib.sha256(raw_message).hexdigest()
     metadata = message_metadata(raw_message, fetch_metadata)
-    existing = find_archived_object(database, sha256)
 
-    if existing is not None:
+    if archived_object_exists(database, sha256):
         with database:
             record_occurrence(database, mailbox.key, uidvalidity, uid, sha256, metadata)
         LOG.info("Already archived: folder=%s uid=%s sha256=%s", mailbox.key, uid, sha256)
@@ -858,7 +861,14 @@ def archive_message(
         mailbox.key,
     )
     staged_path = stage_message(raw_message, sha256, paths.temp_directory)
-    uploaded = upload_and_verify(bucket, staged_path, object_name, sha256)
+    raw_sha1 = hashlib.sha1(raw_message, usedforsecurity=False).hexdigest()
+    uploaded = upload_and_verify(
+        bucket,
+        staged_path,
+        object_name,
+        sha256,
+        raw_sha1,
+    )
 
     with database:
         database.execute(
