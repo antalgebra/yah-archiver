@@ -79,11 +79,12 @@ class AccountIsolationTests(unittest.TestCase):
             metadata,
             "a" * 64,
             "mail/personal/messages",
+            "Sent",
         )
         self.assertEqual(
             name,
-            "mail/personal/messages/2026/2026-08-30_215246_Quarterly-report_"
-            + "a" * 64
+            "mail/personal/messages/2026/2026-08-30_215246_Sent_Quarterly-report_"
+            + "a" * 16
             + ".eml",
         )
 

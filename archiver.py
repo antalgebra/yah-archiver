@@ -675,12 +675,16 @@ def safe_subject(subject: str) -> str:
 
 
 def make_object_name(
-    metadata: MessageMetadata, sha256: str, message_prefix: str
+    metadata: MessageMetadata,
+    sha256: str,
+    message_prefix: str,
+    source_folder: str,
 ) -> str:
     value = metadata.internal_date.astimezone(timezone.utc)
     return (
         f"{message_prefix}/{value:%Y}/{value:%Y-%m-%d_%H%M%S}_"
-        f"{safe_subject(metadata.subject)}_{sha256}.eml"
+        f"{safe_subject(source_folder)}_{safe_subject(metadata.subject)}_"
+        f"{sha256[:16]}.eml"
     )
 
 
@@ -847,7 +851,12 @@ def archive_message(
         LOG.info("Already archived: folder=%s uid=%s sha256=%s", mailbox.key, uid, sha256)
         return False
 
-    object_name = make_object_name(metadata, sha256, paths.b2_message_prefix)
+    object_name = make_object_name(
+        metadata,
+        sha256,
+        paths.b2_message_prefix,
+        mailbox.key,
+    )
     staged_path = stage_message(raw_message, sha256, paths.temp_directory)
     uploaded = upload_and_verify(bucket, staged_path, object_name, sha256)
 

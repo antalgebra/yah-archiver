@@ -79,7 +79,7 @@ For an account ID such as `personal`:
 | Shared Pushover credentials | `/etc/yah-arch/pushover.env` |
 | SQLite catalog | `/var/lib/yah-arch/data/personal.sqlite3` |
 | Temporary message staging | `/var/lib/yah-arch/tmp/personal/` |
-| B2 messages | `mail/personal/messages/YYYY/YYYY-MM-DD_HHMMSS_...eml` |
+| B2 messages | `mail/personal/messages/YYYY/YYYY-MM-DD_HHMMSS_FOLDER_SUBJECT_HASH16.eml` |
 | B2 audit events | `mail/personal/events/YYYY/YYYY-MM-DD_HHMMSS_...json` |
 | systemd instance | `yah-arch@personal.service` |
 
@@ -90,6 +90,10 @@ The B2 application key can be shared by the account instances for now. It should
 permit upload only under `mail/` and must not have B2 hard-delete capability.
 Messages and audit events use year folders only. The month and day remain in the
 filename so the bucket stays easy to browse without deep date subfolders.
+Message filenames also show the Yahoo folder where the message was first
+archived, such as `Inbox` or `Sent`. The filename uses only the first 16
+characters of the SHA-256 fingerprint for readability; the complete SHA-256
+remains in SQLite and B2 file metadata for verification and deduplication.
 
 ## Files kept outside Git
 
