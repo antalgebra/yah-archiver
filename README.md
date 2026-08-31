@@ -19,8 +19,10 @@ OneDrive mirror; `yah-archive-crawler` will provide read-only analysis.
 
 - Each Yahoo account runs as a separate service instance with its own credential
   file, SQLite catalog, temporary directory, and B2 namespace.
-- Yahoo IMAP is used only for `LIST`, read-only `SELECT`, `UID SEARCH`, and
-  `UID FETCH` operations.
+- Yahoo IMAP is used only for `LIST`, read-only `SELECT`, date-limited
+  `UID SEARCH`, and `UID FETCH` operations.
+- Yahoo Bulk/Spam/Junk folders are excluded before selection, so their messages
+  are not searched, downloaded, cataloged, or monitored for deletion.
 - The archiver never marks, moves, deletes, or expunges Yahoo messages.
 - A message is recorded in SQLite only after B2 accepts and verifies its upload.
 - Removing a message from Yahoo never removes its archived B2 object.
@@ -38,6 +40,11 @@ Yahoo accounts until deletion-evidence and alerting work is complete.
 
 ## Catch-up behavior
 
+- The global `ARCHIVE_AFTER` setting excludes messages dated on or before the
+  chosen date. Yahoo applies the cutoff server-side using IMAP `SINCE`.
+- Changing the cutoff resets only live scan/presence state, preventing older
+  catalog entries from creating disappearance alerts. Existing B2 objects and
+  durable catalog history are retained.
 - Trash is scanned first, followed by Inbox, Sent, and other folders.
 - On the first scan of a folder, existing messages are archived newest first.
 - Historical catch-up is limited to `BACKFILL_BATCH_SIZE` messages per folder per
@@ -81,6 +88,7 @@ For an account ID such as `personal`:
 | Purpose | Location |
 |---|---|
 | Shared B2 credentials | `/etc/yah-arch/b2.env` |
+| Shared archive settings | `/etc/yah-arch/settings.env` |
 | Yahoo credentials | `/etc/yah-arch/accounts/personal.env` |
 | Shared Pushover credentials | `/etc/yah-arch/pushover.env` |
 | SQLite catalog | `/var/lib/yah-arch/data/personal.sqlite3` |
@@ -113,6 +121,28 @@ reference.
 - Ubuntu 24.04
 - Python 3.12
 - `b2sdk` from `requirements.txt`
+
+## Change the date cutoff or B2 destination
+
+Run the global settings wizard:
+
+```bash
+sudo /opt/yah-arch/venv/bin/python /opt/yah-arch/src/settings.py
+```
+
+The date option asks for the latest date to ignore. For example, entering
+`2026-08-30` makes `2026-08-31` the first included IMAP date. The cutoff
+applies to every configured Yahoo account and can be changed again at any time.
+
+The B2 option accepts a new application-key ID, hidden application key, and
+bucket name. It validates authentication, bucket access, Object Lock, and
+`writeFiles` permission before atomically replacing the protected
+configuration. Running account services are then restarted automatically.
+
+The SQLite catalog tracks verified copies by B2 bucket ID. Changing to another
+bucket therefore creates a new destination copy of every date-qualified message
+encountered, even when that content was already archived to the former bucket.
+Old immutable objects are never deleted or moved.
 
 ## Add a Yahoo account
 
