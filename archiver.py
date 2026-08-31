@@ -378,6 +378,21 @@ def mailbox_is_trash(mailbox: Mailbox) -> bool:
     return "\\TRASH" in mailbox.flags or upper_name == "TRASH"
 
 
+def folder_name_is_ignored(folder: str) -> bool:
+    """Return True for spam/bulk folders that are outside archive scope."""
+
+    upper_name = folder.upper()
+    return any(marker in upper_name for marker in ("BULK", "SPAM", "JUNK"))
+
+
+def mailbox_is_ignored(mailbox: Mailbox) -> bool:
+    return (
+        "\\JUNK" in mailbox.flags
+        or "\\SPAM" in mailbox.flags
+        or folder_name_is_ignored(mailbox.key)
+    )
+
+
 def health_value(database: sqlite3.Connection, key: str) -> str | None:
     row = database.execute(
         "SELECT value FROM health_state WHERE key = ?", (key,)
@@ -486,7 +501,7 @@ def list_selectable_mailboxes(client: imaplib.IMAP4_SSL) -> list[Mailbox]:
         if not isinstance(line, bytes):
             raise RuntimeError(f"Unexpected IMAP LIST response: {line!r}")
         mailbox = parse_mailbox_list_line(line)
-        if mailbox is not None:
+        if mailbox is not None and not mailbox_is_ignored(mailbox):
             mailboxes.append(mailbox)
 
     def priority(mailbox: Mailbox) -> tuple[int, str]:
@@ -647,7 +662,20 @@ def parse_internal_date(fetch_metadata: bytes) -> datetime:
 
 
 def bounded_header(message, name: str, limit: int = 1000) -> str:
-    value = message.get(name)
+    try:
+        value = message.get(name)
+    except Exception:
+        # Malformed headers must not prevent preservation of the raw RFC822
+        # message. raw_items() returns the original value without structured
+        # header parsing.
+        value = next(
+            (
+                raw_value
+                for raw_name, raw_value in message.raw_items()
+                if raw_name.lower() == name.lower()
+            ),
+            None,
+        )
     if value is None:
         return ""
     text = " ".join(str(value).replace("\x00", "").split())
@@ -1605,6 +1633,48 @@ def send_pending_alerts(
             break
 
 
+def suppress_ignored_folder_state(database: sqlite3.Connection) -> None:
+    """Remove active spam state and silence already-queued spam alerts."""
+
+    folders = {
+        str(row["folder"])
+        for row in database.execute(
+            "SELECT folder FROM presence_folders "
+            "UNION SELECT folder FROM message_presence "
+            "UNION SELECT folder FROM message_failures "
+            "UNION SELECT folder FROM folder_state "
+            "UNION SELECT folder FROM audit_events WHERE folder IS NOT NULL"
+        ).fetchall()
+        if row["folder"] is not None and folder_name_is_ignored(str(row["folder"]))
+    }
+    if not folders:
+        return
+
+    suppressed_at = iso_utc()
+    with database:
+        for folder in folders:
+            database.execute("DELETE FROM message_presence WHERE folder = ?", (folder,))
+            database.execute("DELETE FROM presence_folders WHERE folder = ?", (folder,))
+            database.execute("DELETE FROM message_failures WHERE folder = ?", (folder,))
+            database.execute("DELETE FROM folder_state WHERE folder = ?", (folder,))
+            # Events that never reached immutable storage were false positives
+            # from folders now explicitly outside the archive scope.
+            database.execute(
+                "DELETE FROM audit_events "
+                "WHERE folder = ? AND b2_uploaded_at IS NULL",
+                (folder,),
+            )
+            # Preserve already-uploaded evidence records but prevent any queued
+            # Pushover notification for those ignored folders.
+            database.execute(
+                "UPDATE audit_events SET alerted_at = ?, "
+                "last_alert_error = 'suppressed: ignored spam folder' "
+                "WHERE folder = ? AND b2_uploaded_at IS NOT NULL "
+                "AND alerted_at IS NULL",
+                (suppressed_at, folder),
+            )
+
+
 def archive_cycle(
     client: imaplib.IMAP4_SSL,
     database: sqlite3.Connection,
@@ -1619,7 +1689,11 @@ def archive_cycle(
     presence_scans: list[MailboxScan] = []
     complete_scan = max_messages is None
     mailboxes = list_selectable_mailboxes(client)
-    LOG.info("Scanning %s selectable Yahoo folders", len(mailboxes))
+    suppress_ignored_folder_state(database)
+    LOG.info(
+        "Scanning %s Yahoo folders (Bulk/Spam/Junk ignored)",
+        len(mailboxes),
+    )
 
     for mailbox in mailboxes:
         if STOP_REQUESTED:
