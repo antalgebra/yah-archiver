@@ -82,7 +82,7 @@ class AccountIsolationTests(unittest.TestCase):
         )
         self.assertEqual(
             name,
-            "mail/personal/messages/2026/08/30/215246_Quarterly-report_"
+            "mail/personal/messages/2026/2026-08-30_215246_Quarterly-report_"
             + "a" * 64
             + ".eml",
         )

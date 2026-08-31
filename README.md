@@ -79,8 +79,8 @@ For an account ID such as `personal`:
 | Shared Pushover credentials | `/etc/yah-arch/pushover.env` |
 | SQLite catalog | `/var/lib/yah-arch/data/personal.sqlite3` |
 | Temporary message staging | `/var/lib/yah-arch/tmp/personal/` |
-| B2 messages | `mail/personal/messages/...` |
-| B2 audit events | `mail/personal/events/...` |
+| B2 messages | `mail/personal/messages/YYYY/YYYY-MM-DD_HHMMSS_...eml` |
+| B2 audit events | `mail/personal/events/YYYY/YYYY-MM-DD_HHMMSS_...json` |
 | systemd instance | `yah-arch@personal.service` |
 
 Account IDs may contain 1–32 lowercase letters, numbers, underscores, or
@@ -88,6 +88,8 @@ hyphens, and must begin with a letter or number.
 
 The B2 application key can be shared by the account instances for now. It should
 permit upload only under `mail/` and must not have B2 hard-delete capability.
+Messages and audit events use year folders only. The month and day remain in the
+filename so the bucket stays easy to browse without deep date subfolders.
 
 ## Files kept outside Git
 

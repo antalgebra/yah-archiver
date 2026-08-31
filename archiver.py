@@ -679,7 +679,7 @@ def make_object_name(
 ) -> str:
     value = metadata.internal_date.astimezone(timezone.utc)
     return (
-        f"{message_prefix}/{value:%Y/%m/%d}/{value:%H%M%S}_"
+        f"{message_prefix}/{value:%Y}/{value:%Y-%m-%d_%H%M%S}_"
         f"{safe_subject(metadata.subject)}_{sha256}.eml"
     )
 
@@ -1439,8 +1439,8 @@ def upload_pending_audit_events(
         name_digest = hashlib.sha256(event_key.encode("utf-8")).hexdigest()[:16]
         safe_type = re.sub(r"[^a-z0-9_-]+", "-", event_type.lower())
         object_name = (
-            f"{paths.b2_event_prefix}/{value:%Y/%m/%d}/"
-            f"{value:%H%M%S}_{safe_type}_{name_digest}.json"
+            f"{paths.b2_event_prefix}/{value:%Y}/"
+            f"{value:%Y-%m-%d_%H%M%S}_{safe_type}_{name_digest}.json"
         )
         raw_sha1 = hashlib.sha1(data, usedforsecurity=False).hexdigest()
         payload_sha256 = hashlib.sha256(data).hexdigest()
