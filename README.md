@@ -111,15 +111,22 @@ wizard on the archive server:
 sudo /opt/yah-arch/venv/bin/python /opt/yah-arch/src/onboard.py
 ```
 
-The wizard asks for a short account ID, the Yahoo email address, and a Yahoo
-app password. Password input is hidden. It writes the account file atomically
-as `root:yaharch` with mode `0640`, installs the systemd service template, and
-offers to enable and start that account's always-on service. It never asks for
-the normal Yahoo password.
+The wizard accepts either the Yahoo account name or its full address. For
+example, `--account hoffmas` automatically uses the service ID `hoffmas` and
+the address `hoffmas@yahoo.com`, eliminating duplicate entry. It shows the
+current Yahoo app-password steps and accepts the password through hidden input.
 
-Run the same command again for every additional account. Reusing an existing
-account ID requires explicit confirmation before its credentials are replaced.
-No credentials are written to this Git repository.
+Before saving anything, the wizard verifies the address and app password by
+logging in to Yahoo IMAP over TLS. After verification, it writes the account
+file atomically as `root:yaharch` with mode `0640`, installs the systemd service
+template, and starts the account's always-on service without additional
+confirmation prompts. It never asks for the normal Yahoo password.
+
+Run the same command again for every additional account. If the derived account
+ID already exists, the wizard recognizes it as a credential refresh, preserves
+its optional polling settings, verifies the replacement app password, and then
+restarts the existing service. No credentials are written to this Git
+repository.
 
 Show the command interface:
 
