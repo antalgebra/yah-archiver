@@ -39,6 +39,7 @@ ACCOUNT_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 IMAP_HOST = "imap.mail.yahoo.com"
 IMAP_PORT = 993
 DEFAULT_POLL_SECONDS = 5
+DEFAULT_FULL_SCAN_SECONDS = 60
 DEFAULT_RETRY_SECONDS = 30
 DEFAULT_BACKFILL_BATCH_SIZE = 10
 DEFAULT_ARCHIVE_AFTER = date(2026, 8, 30)
@@ -540,6 +541,29 @@ def parse_mailbox_list_line(line: bytes) -> Mailbox | None:
     return Mailbox(mailbox, quote_imap_mailbox(mailbox), flags)
 
 
+def mailbox_is_priority(mailbox: Mailbox) -> bool:
+    upper_name = mailbox.key.upper()
+    return (
+        mailbox_is_trash(mailbox)
+        or upper_name == "INBOX"
+        or "\\SENT" in mailbox.flags
+        or upper_name in {"SENT", "SENT ITEMS"}
+    )
+
+
+def mailbox_priority_order(mailbox: Mailbox) -> tuple[int, str]:
+    upper_name = mailbox.key.upper()
+    if mailbox_is_trash(mailbox):
+        rank = 0
+    elif upper_name == "INBOX":
+        rank = 1
+    elif "\\SENT" in mailbox.flags or upper_name in {"SENT", "SENT ITEMS"}:
+        rank = 2
+    else:
+        rank = 3
+    return rank, upper_name
+
+
 def list_selectable_mailboxes(client: imaplib.IMAP4_SSL) -> list[Mailbox]:
     status, lines = client.list()
     if status != "OK" or lines is None:
@@ -553,19 +577,7 @@ def list_selectable_mailboxes(client: imaplib.IMAP4_SSL) -> list[Mailbox]:
         if mailbox is not None and not mailbox_is_ignored(mailbox):
             mailboxes.append(mailbox)
 
-    def priority(mailbox: Mailbox) -> tuple[int, str]:
-        upper_name = mailbox.key.upper()
-        if mailbox_is_trash(mailbox):
-            rank = 0
-        elif upper_name == "INBOX":
-            rank = 1
-        elif "\\SENT" in mailbox.flags or upper_name in {"SENT", "SENT ITEMS"}:
-            rank = 2
-        else:
-            rank = 3
-        return rank, upper_name
-
-    return sorted(mailboxes, key=priority)
+    return sorted(mailboxes, key=mailbox_priority_order)
 
 
 def selected_uidvalidity(client: imaplib.IMAP4_SSL) -> int:
@@ -1517,6 +1529,111 @@ def reconcile_presence(
         set_health(database, "last_successful_presence_scan", observed_at)
 
 
+def observe_priority_arrivals(
+    database: sqlite3.Connection,
+    paths: RuntimePaths,
+    scans: list[MailboxScan],
+) -> None:
+    """Record new priority-folder UIDs without inferring disappearances."""
+
+    observed_at = iso_utc()
+    baseline_exists = health_value(database, "presence_baseline_complete") == "1"
+
+    with database:
+        for scan in scans:
+            previous_folder = database.execute(
+                "SELECT uidvalidity FROM presence_folders WHERE folder = ?",
+                (scan.folder,),
+            ).fetchone()
+            folder_reset = (
+                previous_folder is None
+                or int(previous_folder["uidvalidity"]) != scan.uidvalidity
+            )
+            if folder_reset:
+                database.execute(
+                    "DELETE FROM message_presence WHERE folder = ?",
+                    (scan.folder,),
+                )
+
+            database.execute(
+                "INSERT INTO presence_folders("
+                "folder, uidvalidity, is_trash, present, first_seen_at, "
+                "last_seen_at, missing_clean_scans, disappeared_at"
+                ") VALUES (?, ?, ?, 1, ?, ?, 0, NULL) "
+                "ON CONFLICT(folder) DO UPDATE SET "
+                "uidvalidity = excluded.uidvalidity, "
+                "is_trash = excluded.is_trash, present = 1, "
+                "last_seen_at = excluded.last_seen_at, "
+                "missing_clean_scans = 0, disappeared_at = NULL",
+                (
+                    scan.folder,
+                    scan.uidvalidity,
+                    int(scan.is_trash),
+                    observed_at,
+                    observed_at,
+                ),
+            )
+
+            prior_uids = {
+                int(row["uid"])
+                for row in database.execute(
+                    "SELECT uid FROM message_presence "
+                    "WHERE folder = ? AND uidvalidity = ?",
+                    (scan.folder, scan.uidvalidity),
+                ).fetchall()
+            }
+            for uid in scan.current_uids:
+                sha256 = archived_message_sha256(
+                    database, scan.folder, scan.uidvalidity, uid
+                )
+                database.execute(
+                    "INSERT INTO message_presence("
+                    "folder, uidvalidity, uid, sha256, is_trash, present, "
+                    "first_seen_at, last_seen_at, missing_clean_scans, "
+                    "disappeared_at"
+                    ") VALUES (?, ?, ?, ?, ?, 1, ?, ?, 0, NULL) "
+                    "ON CONFLICT(folder, uidvalidity, uid) DO UPDATE SET "
+                    "sha256 = COALESCE(excluded.sha256, message_presence.sha256), "
+                    "is_trash = excluded.is_trash, present = 1, "
+                    "last_seen_at = excluded.last_seen_at, "
+                    "missing_clean_scans = 0, disappeared_at = NULL",
+                    (
+                        scan.folder,
+                        scan.uidvalidity,
+                        uid,
+                        sha256,
+                        int(scan.is_trash),
+                        observed_at,
+                        observed_at,
+                    ),
+                )
+                if (
+                    baseline_exists
+                    and scan.is_trash
+                    and not folder_reset
+                    and uid not in prior_uids
+                ):
+                    record_audit_event(
+                        database,
+                        f"trash_observed:{scan.folder}:{scan.uidvalidity}:{uid}",
+                        "trash_observed",
+                        observed_at,
+                        scan.folder,
+                        scan.uidvalidity,
+                        uid,
+                        sha256,
+                        {
+                            "account": paths.account,
+                            "meaning": (
+                                "A UID appeared in Yahoo Trash after the baseline. "
+                                "This does not identify who moved it."
+                            ),
+                        },
+                    )
+
+        set_health(database, "last_successful_priority_presence_scan", observed_at)
+
+
 def stage_audit_event(data: bytes, paths: RuntimePaths, event_key: str) -> Path:
     event_directory = paths.temp_directory / "events"
     event_directory.mkdir(parents=True, exist_ok=True)
@@ -1795,16 +1912,17 @@ def archive_cycle(
     backfill_batch_size: int,
     archive_since: date,
     destination_id: str,
+    mailboxes: list[Mailbox],
+    full_scan: bool,
 ) -> tuple[int, int]:
     total_attempted = 0
     total_uploaded = 0
     presence_scans: list[MailboxScan] = []
     complete_scan = max_messages is None
-    mailboxes = list_selectable_mailboxes(client)
-    apply_archive_scope(database, archive_since - timedelta(days=1))
-    suppress_ignored_folder_state(database)
+    scan_kind = "full" if full_scan else "priority"
     LOG.info(
-        "Scanning %s Yahoo folders since %s (Bulk/Spam/Junk ignored)",
+        "Starting %s scan of %s Yahoo folders since %s",
+        scan_kind,
         len(mailboxes),
         archive_since.isoformat(),
     )
@@ -1840,7 +1958,8 @@ def archive_cycle(
         total_uploaded += uploaded
 
     LOG.info(
-        "Scan complete: attempted=%s newly-uploaded=%s",
+        "%s scan complete: attempted=%s newly-uploaded=%s",
+        scan_kind.capitalize(),
         total_attempted,
         total_uploaded,
     )
@@ -1851,12 +1970,21 @@ def archive_cycle(
     if complete_scan and not STOP_REQUESTED:
         with database:
             set_health(database, "last_successful_archive_cycle")
-        try:
-            reconcile_presence(database, paths, presence_scans)
-        except Exception:
-            LOG.exception(
-                "Presence reconciliation failed; message archiving remains active"
-            )
+            if full_scan:
+                set_health(database, "last_successful_full_scan")
+
+    try:
+        if full_scan:
+            if complete_scan and not STOP_REQUESTED:
+                reconcile_presence(database, paths, presence_scans)
+        elif not STOP_REQUESTED:
+            # Arrival-only reconciliation is safe even when another priority
+            # folder failed; it never concludes that a message disappeared.
+            observe_priority_arrivals(database, paths, presence_scans)
+    except Exception:
+        LOG.exception(
+            "Presence reconciliation failed; message archiving remains active"
+        )
 
     try:
         upload_pending_audit_events(database, bucket, paths)
@@ -1944,6 +2072,11 @@ def run(argv: list[str]) -> int:
     poll_seconds = parse_positive_int(
         yahoo_config.get("POLL_SECONDS"), DEFAULT_POLL_SECONDS, "POLL_SECONDS"
     )
+    full_scan_seconds = parse_positive_int(
+        settings_config.get("FULL_SCAN_SECONDS"),
+        DEFAULT_FULL_SCAN_SECONDS,
+        "FULL_SCAN_SECONDS",
+    )
     retry_seconds = parse_positive_int(
         yahoo_config.get("RETRY_SECONDS"), DEFAULT_RETRY_SECONDS, "RETRY_SECONDS"
     )
@@ -1959,6 +2092,8 @@ def run(argv: list[str]) -> int:
     bucket = create_b2_client(b2_config, paths.b2_config_path)
     destination_id = str(bucket.id_)
     initialize_archive_destination(database, destination_id)
+    apply_archive_scope(database, archive_after)
+    suppress_ignored_folder_state(database)
     LOG.info(
         "B2 authorization succeeded: account=%s bucket=%s destination=%s "
         "prefix=%s archive-since=%s",
@@ -1973,6 +2108,7 @@ def run(argv: list[str]) -> int:
         client = None
         try:
             client = connect_yahoo(yahoo_config, paths.yahoo_config_path)
+            mailboxes = list_selectable_mailboxes(client)
             archive_cycle(
                 client,
                 database,
@@ -1983,6 +2119,8 @@ def run(argv: list[str]) -> int:
                 backfill_batch_size,
                 archive_since,
                 destination_id,
+                mailboxes,
+                True,
             )
             return 0
         finally:
@@ -1993,7 +2131,27 @@ def run(argv: list[str]) -> int:
         client = None
         try:
             client = connect_yahoo(yahoo_config, paths.yahoo_config_path)
+            all_mailboxes = list_selectable_mailboxes(client)
+            priority_mailboxes = [
+                mailbox for mailbox in all_mailboxes if mailbox_is_priority(mailbox)
+            ]
+            next_full_scan = time.monotonic() + poll_seconds
+
             while not STOP_REQUESTED:
+                full_scan = time.monotonic() >= next_full_scan
+                if full_scan:
+                    # Refresh the folder list only for full scans. Fast scans
+                    # reuse the cached priority list.
+                    all_mailboxes = list_selectable_mailboxes(client)
+                    priority_mailboxes = [
+                        mailbox
+                        for mailbox in all_mailboxes
+                        if mailbox_is_priority(mailbox)
+                    ]
+                    selected_mailboxes = all_mailboxes
+                else:
+                    selected_mailboxes = priority_mailboxes
+
                 archive_cycle(
                     client,
                     database,
@@ -2004,7 +2162,12 @@ def run(argv: list[str]) -> int:
                     backfill_batch_size,
                     archive_since,
                     destination_id,
+                    selected_mailboxes,
+                    full_scan,
                 )
+                if full_scan:
+                    next_full_scan = time.monotonic() + full_scan_seconds
+
                 wait_interruptibly(poll_seconds)
                 if not STOP_REQUESTED:
                     status, _data = client.noop()
