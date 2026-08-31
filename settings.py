@@ -212,7 +212,10 @@ def main() -> int:
         else:
             print("No changes made.")
             return 1
-    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+    except KeyboardInterrupt:
+        print("\nNo changes made.")
+        return 1
+    except Exception as error:
         print(f"Could not apply settings: {error}", file=sys.stderr)
         return 1
     return 0
