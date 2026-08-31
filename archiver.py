@@ -25,7 +25,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.parser import BytesHeaderParser
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -33,6 +33,7 @@ from pathlib import Path
 CONFIG_DIRECTORY = Path("/etc/yah-arch")
 STATE_DIRECTORY = Path("/var/lib/yah-arch")
 B2_CONFIG_PATH = CONFIG_DIRECTORY / "b2.env"
+SETTINGS_CONFIG_PATH = CONFIG_DIRECTORY / "settings.env"
 ACCOUNT_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 
 IMAP_HOST = "imap.mail.yahoo.com"
@@ -40,6 +41,7 @@ IMAP_PORT = 993
 DEFAULT_POLL_SECONDS = 5
 DEFAULT_RETRY_SECONDS = 30
 DEFAULT_BACKFILL_BATCH_SIZE = 10
+DEFAULT_ARCHIVE_AFTER = date(2026, 8, 30)
 FAILURE_RETRY_BATCH_SIZE = 25
 MAX_CONSECUTIVE_MESSAGE_FAILURES = 3
 PUSHOVER_MESSAGES_URL = "https://api.pushover.net/1/messages.json"
@@ -143,6 +145,19 @@ def read_env(path: Path) -> dict[str, str]:
     return values
 
 
+def read_optional_env(path: Path) -> dict[str, str]:
+    return read_env(path) if path.exists() else {}
+
+
+def parse_archive_after(value: str | None) -> date:
+    if value is None:
+        return DEFAULT_ARCHIVE_AFTER
+    try:
+        return date.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError("ARCHIVE_AFTER must use YYYY-MM-DD") from error
+
+
 def require_settings(config: dict[str, str], names: tuple[str, ...], source: Path) -> None:
     missing = [name for name in names if not config.get(name)]
     if missing:
@@ -205,6 +220,21 @@ def initialize_database(path: Path) -> sqlite3.Connection:
             b2_sha1 TEXT NOT NULL,
             archived_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS archive_copies (
+            sha256 TEXT NOT NULL,
+            destination_id TEXT NOT NULL,
+            object_name TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            b2_file_id TEXT NOT NULL,
+            b2_sha1 TEXT NOT NULL,
+            archived_at TEXT NOT NULL,
+            PRIMARY KEY (sha256, destination_id),
+            FOREIGN KEY (sha256) REFERENCES archive_objects(sha256)
+        );
+
+        CREATE INDEX IF NOT EXISTS archive_copies_destination_idx
+            ON archive_copies(destination_id, archived_at);
 
         CREATE TABLE IF NOT EXISTS imap_messages (
             folder TEXT NOT NULL,
@@ -408,6 +438,25 @@ def set_health(database: sqlite3.Connection, key: str, value: str | None = None)
         "updated_at = excluded.updated_at",
         (key, value or now, now),
     )
+
+
+def initialize_archive_destination(
+    database: sqlite3.Connection, destination_id: str
+) -> None:
+    """Associate legacy rows with the first destination seen after migration."""
+
+    previous = health_value(database, "current_b2_destination")
+    with database:
+        if previous is None:
+            database.execute(
+                "INSERT OR IGNORE INTO archive_copies("
+                "sha256, destination_id, object_name, size_bytes, b2_file_id, "
+                "b2_sha1, archived_at"
+                ") SELECT sha256, ?, object_name, size_bytes, b2_file_id, "
+                "b2_sha1, archived_at FROM archive_objects",
+                (destination_id,),
+            )
+        set_health(database, "current_b2_destination", destination_id)
 
 
 def record_audit_event(
@@ -621,8 +670,13 @@ def update_backfill_cursor(
     )
 
 
-def search_all_uids(client: imaplib.IMAP4_SSL) -> list[int]:
-    status, data = client.uid("SEARCH", None, "ALL")
+def search_all_uids(
+    client: imaplib.IMAP4_SSL, archive_since: date
+) -> list[int]:
+    # Yahoo evaluates IMAP SINCE against INTERNALDATE. Filtering on the server
+    # avoids downloading, hashing, or tracking older messages.
+    imap_date = archive_since.strftime("%d-%b-%Y")
+    status, data = client.uid("SEARCH", None, "SINCE", imap_date)
     if status != "OK" or data is None:
         raise ImapCommandError(f"IMAP UID SEARCH failed: {status}")
     values = data[0].split() if data and isinstance(data[0], bytes) else []
@@ -743,10 +797,13 @@ def stage_message(raw_message: bytes, sha256: str, temp_directory: Path) -> Path
     return final_path
 
 
-def archived_object_exists(database: sqlite3.Connection, sha256: str) -> bool:
+def archived_copy_exists(
+    database: sqlite3.Connection, sha256: str, destination_id: str
+) -> bool:
     return database.execute(
-        "SELECT 1 FROM archive_objects WHERE sha256 = ?",
-        (sha256,),
+        "SELECT 1 FROM archive_copies "
+        "WHERE sha256 = ? AND destination_id = ?",
+        (sha256, destination_id),
     ).fetchone() is not None
 
 
@@ -872,14 +929,20 @@ def archive_message(
     uid: int,
     fetch_metadata: bytes,
     raw_message: bytes,
+    destination_id: str,
 ) -> bool:
     sha256 = hashlib.sha256(raw_message).hexdigest()
     metadata = message_metadata(raw_message, fetch_metadata)
 
-    if archived_object_exists(database, sha256):
+    if archived_copy_exists(database, sha256, destination_id):
         with database:
             record_occurrence(database, mailbox.key, uidvalidity, uid, sha256, metadata)
-        LOG.info("Already archived: folder=%s uid=%s sha256=%s", mailbox.key, uid, sha256)
+        LOG.info(
+            "Already archived in destination: folder=%s uid=%s sha256=%s",
+            mailbox.key,
+            uid,
+            sha256,
+        )
         return False
 
     object_name = make_object_name(
@@ -899,8 +962,9 @@ def archive_message(
     )
 
     with database:
+        archived_at = iso_utc()
         database.execute(
-            "INSERT INTO archive_objects("
+            "INSERT OR IGNORE INTO archive_objects("
             "sha256, object_name, size_bytes, b2_file_id, b2_sha1, archived_at"
             ") VALUES (?, ?, ?, ?, ?, ?)",
             (
@@ -909,7 +973,22 @@ def archive_message(
                 len(raw_message),
                 uploaded.id_,
                 uploaded.content_sha1,
-                iso_utc(),
+                archived_at,
+            ),
+        )
+        database.execute(
+            "INSERT INTO archive_copies("
+            "sha256, destination_id, object_name, size_bytes, b2_file_id, "
+            "b2_sha1, archived_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                sha256,
+                destination_id,
+                object_name,
+                len(raw_message),
+                uploaded.id_,
+                uploaded.content_sha1,
+                archived_at,
             ),
         )
         record_occurrence(database, mailbox.key, uidvalidity, uid, sha256, metadata)
@@ -939,6 +1018,7 @@ def attempt_message(
     mailbox: Mailbox,
     uidvalidity: int,
     uid: int,
+    destination_id: str,
 ) -> MessageAttempt:
     """Attempt one message without letting a poison message block later UIDs."""
 
@@ -995,6 +1075,7 @@ def attempt_message(
             uid,
             fetch_metadata,
             raw_message,
+            destination_id,
         )
         with database:
             clear_message_failure(database, mailbox.key, uidvalidity, uid)
@@ -1028,6 +1109,8 @@ def archive_mailbox(
     mailbox: Mailbox,
     remaining_limit: int | None,
     backfill_batch_size: int,
+    archive_since: date,
+    destination_id: str,
     presence_scans: list[MailboxScan] | None = None,
 ) -> tuple[int, int]:
     status, _data = client.select(mailbox.select_argument, readonly=True)
@@ -1035,7 +1118,7 @@ def archive_mailbox(
         raise RuntimeError(f"IMAP read-only SELECT failed for {mailbox.key}: {status}")
 
     uidvalidity = selected_uidvalidity(client)
-    current_uids = search_all_uids(client)
+    current_uids = search_all_uids(client, archive_since)
     state = ensure_folder_state(database, mailbox.key, uidvalidity, current_uids)
     attempted = 0
     uploaded = 0
@@ -1073,6 +1156,7 @@ def archive_mailbox(
             mailbox,
             uidvalidity,
             uid,
+            destination_id,
         )
         with database:
             update_live_cursor(database, mailbox.key, uidvalidity, uid)
@@ -1106,6 +1190,7 @@ def archive_mailbox(
                 mailbox,
                 uidvalidity,
                 uid,
+                destination_id,
             )
             backfill_before_uid = uid
             with database:
@@ -1151,6 +1236,7 @@ def archive_mailbox(
                 mailbox,
                 uidvalidity,
                 uid,
+                destination_id,
             )
             note_attempt(uid, result)
 
@@ -1633,6 +1719,30 @@ def send_pending_alerts(
             break
 
 
+def apply_archive_scope(database: sqlite3.Connection, archive_after: date) -> None:
+    """Reset live presence state when the operator changes the date cutoff."""
+
+    configured_value = archive_after.isoformat()
+    if health_value(database, "archive_after") == configured_value:
+        return
+
+    changed_at = iso_utc()
+    with database:
+        database.execute("DELETE FROM message_presence")
+        database.execute("DELETE FROM presence_folders")
+        database.execute("DELETE FROM message_failures")
+        database.execute("DELETE FROM folder_state")
+        database.execute("DELETE FROM audit_events WHERE b2_uploaded_at IS NULL")
+        database.execute(
+            "UPDATE audit_events SET alerted_at = ?, "
+            "last_alert_error = 'suppressed: archive date scope changed' "
+            "WHERE b2_uploaded_at IS NOT NULL AND alerted_at IS NULL",
+            (changed_at,),
+        )
+        set_health(database, "presence_baseline_complete", "0")
+        set_health(database, "archive_after", configured_value)
+
+
 def suppress_ignored_folder_state(database: sqlite3.Connection) -> None:
     """Remove active spam state and silence already-queued spam alerts."""
 
@@ -1683,16 +1793,20 @@ def archive_cycle(
     pushover_config: dict[str, str],
     max_messages: int | None,
     backfill_batch_size: int,
+    archive_since: date,
+    destination_id: str,
 ) -> tuple[int, int]:
     total_attempted = 0
     total_uploaded = 0
     presence_scans: list[MailboxScan] = []
     complete_scan = max_messages is None
     mailboxes = list_selectable_mailboxes(client)
+    apply_archive_scope(database, archive_since - timedelta(days=1))
     suppress_ignored_folder_state(database)
     LOG.info(
-        "Scanning %s Yahoo folders (Bulk/Spam/Junk ignored)",
+        "Scanning %s Yahoo folders since %s (Bulk/Spam/Junk ignored)",
         len(mailboxes),
+        archive_since.isoformat(),
     )
 
     for mailbox in mailboxes:
@@ -1712,6 +1826,8 @@ def archive_cycle(
                 mailbox,
                 remaining,
                 backfill_batch_size,
+                archive_since,
+                destination_id,
                 presence_scans,
             )
         except (CycleAbortError, ImapCommandError, imaplib.IMAP4.abort, OSError):
@@ -1817,6 +1933,7 @@ def run(argv: list[str]) -> int:
     args = parse_arguments(argv)
     paths = runtime_paths(args.account)
     b2_config = read_env(paths.b2_config_path)
+    settings_config = read_optional_env(SETTINGS_CONFIG_PATH)
     yahoo_config = read_env(paths.yahoo_config_path)
     pushover_config = read_env(paths.pushover_config_path)
     require_settings(
@@ -1835,14 +1952,21 @@ def run(argv: list[str]) -> int:
         DEFAULT_BACKFILL_BATCH_SIZE,
         "BACKFILL_BATCH_SIZE",
     )
+    archive_after = parse_archive_after(settings_config.get("ARCHIVE_AFTER"))
+    archive_since = archive_after + timedelta(days=1)
 
     database = initialize_database(paths.database_path)
     bucket = create_b2_client(b2_config, paths.b2_config_path)
+    destination_id = str(bucket.id_)
+    initialize_archive_destination(database, destination_id)
     LOG.info(
-        "B2 authorization succeeded: account=%s bucket=%s prefix=%s",
+        "B2 authorization succeeded: account=%s bucket=%s destination=%s "
+        "prefix=%s archive-since=%s",
         paths.account,
         b2_config["B2_BUCKET"],
+        destination_id,
         paths.b2_message_prefix,
+        archive_since.isoformat(),
     )
 
     if args.once:
@@ -1857,6 +1981,8 @@ def run(argv: list[str]) -> int:
                 pushover_config,
                 args.max_messages,
                 backfill_batch_size,
+                archive_since,
+                destination_id,
             )
             return 0
         finally:
@@ -1876,6 +2002,8 @@ def run(argv: list[str]) -> int:
                     pushover_config,
                     None,
                     backfill_batch_size,
+                    archive_since,
+                    destination_id,
                 )
                 wait_interruptibly(poll_seconds)
                 if not STOP_REQUESTED:
