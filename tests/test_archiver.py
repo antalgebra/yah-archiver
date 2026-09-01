@@ -6,7 +6,7 @@ import io
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -129,6 +129,73 @@ class DatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_legacy_presence_schema_adds_junk_lineage_without_data_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "presence.sqlite3"
+            legacy = sqlite3.connect(database_path)
+            legacy.executescript(
+                """
+                CREATE TABLE presence_folders (
+                    folder TEXT PRIMARY KEY,
+                    uidvalidity INTEGER NOT NULL,
+                    is_trash INTEGER NOT NULL,
+                    present INTEGER NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    missing_clean_scans INTEGER NOT NULL DEFAULT 0,
+                    disappeared_at TEXT
+                );
+                INSERT INTO presence_folders VALUES (
+                    'INBOX', 77, 0, 1, 'first', 'last', 0, NULL
+                );
+                CREATE TABLE message_presence (
+                    folder TEXT NOT NULL,
+                    uidvalidity INTEGER NOT NULL,
+                    uid INTEGER NOT NULL,
+                    sha256 TEXT,
+                    is_trash INTEGER NOT NULL,
+                    present INTEGER NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    missing_clean_scans INTEGER NOT NULL DEFAULT 0,
+                    disappeared_at TEXT,
+                    PRIMARY KEY (folder, uidvalidity, uid)
+                );
+                INSERT INTO message_presence VALUES (
+                    'INBOX', 77, 1, NULL, 0, 1, 'first', 'last', 0, NULL
+                );
+                """
+            )
+            legacy.commit()
+            legacy.close()
+
+            connection = archiver.initialize_database(
+                database_path
+            )
+            try:
+                for table in ("presence_folders", "message_presence"):
+                    columns = {
+                        row["name"]
+                        for row in connection.execute(
+                            f"PRAGMA table_info({table})"
+                        ).fetchall()
+                    }
+                    self.assertIn("is_junk", columns)
+                    row = connection.execute(
+                        f"SELECT is_junk, present FROM {table}"
+                    ).fetchone()
+                    self.assertEqual(row["is_junk"], 0)
+                    self.assertEqual(row["present"], 1)
+                indexes = {
+                    row["name"]
+                    for row in connection.execute(
+                        "PRAGMA index_list(message_presence)"
+                    ).fetchall()
+                }
+                self.assertIn("message_presence_junk_sha_idx", indexes)
+            finally:
+                connection.close()
+
 
 class ScanOrderingTests(unittest.TestCase):
     def test_high_risk_mailboxes_are_ordered_first(self) -> None:
@@ -140,13 +207,29 @@ class ScanOrderingTests(unittest.TestCase):
                 b'(\\HasNoChildren \\Sent) "/" "Sent"',
                 b'(\\HasNoChildren) "/" "INBOX"',
                 b'(\\HasNoChildren \\Trash) "/" "Trash"',
+                b'(\\HasNoChildren \\Junk) "/" "Bulk Mail"',
+                b'(\\HasNoChildren) "/" "Spam"',
             ],
         )
         mailboxes = archiver.list_selectable_mailboxes(client)
         self.assertEqual(
             [mailbox.key for mailbox in mailboxes],
-            ["Trash", "INBOX", "Sent", "Archive"],
+            ["Trash", "Bulk Mail", "Spam", "INBOX", "Sent", "Archive"],
         )
+        self.assertTrue(archiver.mailbox_is_priority(mailboxes[1]))
+        self.assertTrue(archiver.mailbox_is_junk(mailboxes[1]))
+        self.assertTrue(archiver.mailbox_is_junk(mailboxes[2]))
+
+    def test_junk_name_fallback_does_not_match_unrelated_folders(self) -> None:
+        for folder in ("Bulk invoices", "Junkyard", "Spam reports"):
+            with self.subTest(folder=folder):
+                mailbox = archiver.Mailbox(folder, f'"{folder}"', frozenset())
+                self.assertFalse(archiver.mailbox_is_junk(mailbox))
+
+        quarantine = archiver.Mailbox(
+            "Quarantine", '"Quarantine"', frozenset({"\\JUNK"})
+        )
+        self.assertTrue(archiver.mailbox_is_junk(quarantine))
 
     def test_initial_backfill_is_newest_first_then_live_mail_is_contiguous(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -170,10 +253,12 @@ class ScanOrderingTests(unittest.TestCase):
                         mailbox,
                         None,
                         2,
+                        date(2026, 8, 31),
+                        "destination-1",
                     )
                     self.assertEqual(result, (2, 2))
                     self.assertEqual(
-                        [call.args[-1] for call in attempt.call_args_list],
+                        [call.args[-2] for call in attempt.call_args_list],
                         [9, 5],
                     )
 
@@ -196,9 +281,11 @@ class ScanOrderingTests(unittest.TestCase):
                         mailbox,
                         None,
                         2,
+                        date(2026, 8, 31),
+                        "destination-1",
                     )
                     self.assertEqual(
-                        [call.args[-1] for call in attempt.call_args_list],
+                        [call.args[-2] for call in attempt.call_args_list],
                         [2],
                     )
 
@@ -214,9 +301,11 @@ class ScanOrderingTests(unittest.TestCase):
                         mailbox,
                         None,
                         2,
+                        date(2026, 8, 31),
+                        "destination-1",
                     )
                     self.assertEqual(
-                        [call.args[-1] for call in attempt.call_args_list],
+                        [call.args[-2] for call in attempt.call_args_list],
                         [10, 12],
                     )
 
@@ -259,10 +348,12 @@ class FailureIsolationTests(unittest.TestCase):
                         mailbox,
                         None,
                         10,
+                        date(2026, 8, 31),
+                        "destination-1",
                     )
                     self.assertEqual(result, (2, 1))
                     self.assertEqual(
-                        [call.args[-1] for call in attempt.call_args_list],
+                        [call.args[-2] for call in attempt.call_args_list],
                         [9, 5],
                     )
             finally:
@@ -288,7 +379,14 @@ class FailureIsolationTests(unittest.TestCase):
                 ):
                     with self.assertLogs("yah-arch", level="ERROR"):
                         first = archiver.attempt_message(
-                            object(), connection, object(), paths, mailbox, 77, 9
+                            object(),
+                            connection,
+                            object(),
+                            paths,
+                            mailbox,
+                            77,
+                            9,
+                            "destination-1",
                         )
                     self.assertTrue(first.retryable_failure)
                     row = connection.execute(
@@ -299,13 +397,266 @@ class FailureIsolationTests(unittest.TestCase):
                     self.assertIn("bad MIME", row["last_error"])
 
                     second = archiver.attempt_message(
-                        object(), connection, object(), paths, mailbox, 77, 9
+                        object(),
+                        connection,
+                        object(),
+                        paths,
+                        mailbox,
+                        77,
+                        9,
+                        "destination-1",
                     )
                     self.assertTrue(second.uploaded)
                     remaining = connection.execute(
                         "SELECT COUNT(*) FROM message_failures"
                     ).fetchone()[0]
                     self.assertEqual(remaining, 0)
+            finally:
+                connection.close()
+
+    def test_junk_disappeared_before_fetch_is_recorded_without_alerting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connection = archiver.initialize_database(
+                Path(directory) / "junk-fetch.sqlite3"
+            )
+            mailbox = archiver.Mailbox(
+                "Bulk Mail", '"Bulk Mail"', frozenset({"\\JUNK"})
+            )
+            paths = archiver.runtime_paths("personal")
+            try:
+                with mock.patch.object(
+                    archiver, "fetch_raw_message", return_value=None
+                ):
+                    with self.assertLogs("yah-arch", level="WARNING"):
+                        result = archiver.attempt_message(
+                            object(),
+                            connection,
+                            object(),
+                            paths,
+                            mailbox,
+                            77,
+                            9,
+                            "destination-1",
+                        )
+                self.assertFalse(result.retryable_failure)
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT failure_kind FROM message_failures"
+                    ).fetchone()["failure_kind"],
+                    "disappeared_before_fetch",
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM audit_events"
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                connection.close()
+
+
+class PresenceReconciliationTests(unittest.TestCase):
+    SHA256 = "a" * 64
+
+    @staticmethod
+    def scan(
+        folder: str,
+        uids: tuple[int, ...],
+        *,
+        is_trash: bool = False,
+        is_junk: bool = False,
+    ) -> archiver.MailboxScan:
+        return archiver.MailboxScan(
+            attempted=0,
+            uploaded=0,
+            folder=folder,
+            uidvalidity=77,
+            current_uids=uids,
+            is_trash=is_trash,
+            is_junk=is_junk,
+        )
+
+    def record_occurrence(
+        self, connection: sqlite3.Connection, folder: str, uid: int
+    ) -> None:
+        with connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO archive_objects("
+                "sha256, object_name, size_bytes, b2_file_id, b2_sha1, archived_at"
+                ") VALUES (?, ?, 10, 'file-1', ?, '2026-09-01T00:00:00+00:00')",
+                (self.SHA256, f"mail/{self.SHA256}.eml", "b" * 40),
+            )
+            connection.execute(
+                "INSERT INTO imap_messages("
+                "folder, uidvalidity, uid, sha256, internal_date, message_id, "
+                "sender, recipients, subject, first_seen_at"
+                ") VALUES (?, 77, ?, ?, '2026-09-01T00:00:00+00:00', "
+                "'<same@example.invalid>', 'from@example.invalid', "
+                "'to@example.invalid', 'Test', '2026-09-01T00:00:00+00:00')",
+                (folder, uid, self.SHA256),
+            )
+
+    def test_inbox_to_junk_to_trash_to_deleted_creates_no_alerts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connection = archiver.initialize_database(
+                Path(directory) / "junk-chain.sqlite3"
+            )
+            paths = archiver.runtime_paths("personal")
+            try:
+                self.record_occurrence(connection, "INBOX", 1)
+                self.record_occurrence(connection, "Bulk Mail", 2)
+                self.record_occurrence(connection, "Trash", 3)
+
+                def reconcile(
+                    inbox: tuple[int, ...],
+                    junk: tuple[int, ...],
+                    trash: tuple[int, ...],
+                ) -> None:
+                    archiver.reconcile_presence(
+                        connection,
+                        paths,
+                        [
+                            self.scan("Trash", trash, is_trash=True),
+                            self.scan("Bulk Mail", junk, is_junk=True),
+                            self.scan("INBOX", inbox),
+                        ],
+                    )
+
+                reconcile((1,), (), ())
+                reconcile((), (2,), ())
+                reconcile((), (2,), ())
+                reconcile((), (), (3,))
+                reconcile((), (), (3,))
+                reconcile((), (), ())
+                reconcile((), (), ())
+
+                events = connection.execute(
+                    "SELECT event_type FROM audit_events"
+                ).fetchall()
+                self.assertEqual(events, [])
+            finally:
+                connection.close()
+
+    def test_same_snapshot_junk_correlation_is_scan_order_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connection = archiver.initialize_database(
+                Path(directory) / "same-snapshot.sqlite3"
+            )
+            paths = archiver.runtime_paths("personal")
+            try:
+                self.record_occurrence(connection, "Bulk Mail", 2)
+                self.record_occurrence(connection, "Trash", 3)
+                baseline = [
+                    self.scan("Trash", (), is_trash=True),
+                    self.scan("Bulk Mail", (), is_junk=True),
+                ]
+                archiver.reconcile_presence(connection, paths, baseline)
+
+                # Trash deliberately comes first. Correlation must use the
+                # complete snapshot rather than depending on scan order.
+                moved = [
+                    self.scan("Trash", (3,), is_trash=True),
+                    self.scan("Bulk Mail", (2,), is_junk=True),
+                ]
+                archiver.reconcile_presence(connection, paths, moved)
+
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM audit_events"
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                connection.close()
+
+    def test_genuine_inbox_disappearance_still_creates_an_alert_event(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connection = archiver.initialize_database(
+                Path(directory) / "real-disappearance.sqlite3"
+            )
+            paths = archiver.runtime_paths("personal")
+            try:
+                self.record_occurrence(connection, "INBOX", 1)
+                archiver.reconcile_presence(
+                    connection, paths, [self.scan("INBOX", (1,))]
+                )
+                archiver.reconcile_presence(
+                    connection, paths, [self.scan("INBOX", ())]
+                )
+                archiver.reconcile_presence(
+                    connection, paths, [self.scan("INBOX", ())]
+                )
+
+                events = connection.execute(
+                    "SELECT event_type FROM audit_events"
+                ).fetchall()
+                self.assertEqual(
+                    [row["event_type"] for row in events],
+                    ["unexplained_disappearance"],
+                )
+            finally:
+                connection.close()
+
+    def test_genuine_trash_arrival_and_disappearance_still_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connection = archiver.initialize_database(
+                Path(directory) / "real-trash.sqlite3"
+            )
+            paths = archiver.runtime_paths("personal")
+            try:
+                self.record_occurrence(connection, "Trash", 3)
+                empty = [self.scan("Trash", (), is_trash=True)]
+                present = [self.scan("Trash", (3,), is_trash=True)]
+                archiver.reconcile_presence(connection, paths, empty)
+                archiver.observe_priority_arrivals(connection, paths, present)
+                archiver.reconcile_presence(connection, paths, empty)
+                archiver.reconcile_presence(connection, paths, empty)
+
+                events = connection.execute(
+                    "SELECT event_type FROM audit_events ORDER BY observed_at, event_key"
+                ).fetchall()
+                self.assertEqual(
+                    {row["event_type"] for row in events},
+                    {"trash_observed", "trash_disappeared"},
+                )
+            finally:
+                connection.close()
+
+    def test_queued_false_alert_is_suppressed_after_junk_correlation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connection = archiver.initialize_database(
+                Path(directory) / "queued-alert.sqlite3"
+            )
+            paths = archiver.runtime_paths("personal")
+            try:
+                self.record_occurrence(connection, "Bulk Mail", 2)
+                with connection:
+                    archiver.record_audit_event(
+                        connection,
+                        "legacy-unexplained",
+                        "unexplained_disappearance",
+                        "2026-09-01T00:00:00+00:00",
+                        "INBOX",
+                        77,
+                        1,
+                        self.SHA256,
+                        {"account": "personal"},
+                    )
+
+                archiver.observe_priority_arrivals(
+                    connection,
+                    paths,
+                    [self.scan("Bulk Mail", (2,), is_junk=True)],
+                )
+                row = connection.execute(
+                    "SELECT alerted_at, last_alert_error FROM audit_events "
+                    "WHERE event_key = 'legacy-unexplained'"
+                ).fetchone()
+                self.assertIsNotNone(row["alerted_at"])
+                self.assertEqual(
+                    row["last_alert_error"],
+                    "suppressed: content observed in spam/junk",
+                )
             finally:
                 connection.close()
 
