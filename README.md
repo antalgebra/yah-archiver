@@ -11,9 +11,11 @@ This repository owns two related guarantees:
 Deletion evidence shares the collector's coherent IMAP scan but has separate
 state and health timestamps. Evidence is stored in SQLite and copied to the
 Object-Locked B2 bucket. After that upload succeeds, a compact Pushover alert is
-sent with title `YahArch:<first 7 account characters>` and only the first 20
-characters of the archived `Subject:` header as its body. Message bodies are
-never included. The companion
+sent with title `YahArch:<first 7 account characters>` and the first 50
+normalized characters of the visible message body. Plain text is preferred;
+attachments and HTML markup are excluded. This deliberately shares that short
+excerpt with Pushover. Messages archived before preview support may instead say
+`Body unavailable`. The companion
 `yah-archive-ops` project monitors archive health, `yah-deleted-onedrive`
 provides a copy-only OneDrive mirror, and `yah-archive-crawler` is reserved for
 read-only analysis.

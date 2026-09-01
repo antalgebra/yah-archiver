@@ -26,8 +26,9 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
-from email.parser import BytesHeaderParser
+from email.parser import BytesHeaderParser, BytesParser
 from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 from pathlib import Path
 
 CONFIG_DIRECTORY = Path("/etc/yah-arch")
@@ -48,6 +49,8 @@ MAX_CONSECUTIVE_MESSAGE_FAILURES = 3
 MAX_IMAP_UID = (1 << 32) - 1
 SQLITE_UID_BATCH_SIZE = 900
 PUSHOVER_MESSAGES_URL = "https://api.pushover.net/1/messages.json"
+ALERT_BODY_PREVIEW_CHARACTERS = 50
+BODY_PREVIEW_UNAVAILABLE = "Body unavailable"
 
 LOG = logging.getLogger("yah-arch")
 STOP_REQUESTED = False
@@ -74,6 +77,7 @@ class MessageMetadata:
     sender: str
     recipients: str
     subject: str
+    body_preview: str = BODY_PREVIEW_UNAVAILABLE
 
 
 @dataclass(frozen=True)
@@ -124,6 +128,31 @@ class ImapCommandError(RuntimeError):
 
 class CycleAbortError(RuntimeError):
     """A systemic-looking failure should stop this cycle and retry later."""
+
+
+class VisibleTextHTMLParser(HTMLParser):
+    """Collect visible HTML text without scripts, styles, or document metadata."""
+
+    HIDDEN_ELEMENTS = frozenset(
+        {"head", "noscript", "script", "style", "svg", "template"}
+    )
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.hidden_depth = 0
+        self.chunks: list[str] = []
+
+    def handle_starttag(self, tag: str, _attrs) -> None:
+        if tag.lower() in self.HIDDEN_ELEMENTS:
+            self.hidden_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in self.HIDDEN_ELEMENTS and self.hidden_depth:
+            self.hidden_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self.hidden_depth:
+            self.chunks.append(data)
 
 
 def utc_now() -> datetime:
@@ -227,7 +256,8 @@ def initialize_database(path: Path) -> sqlite3.Connection:
             size_bytes INTEGER NOT NULL,
             b2_file_id TEXT NOT NULL,
             b2_sha1 TEXT NOT NULL,
-            archived_at TEXT NOT NULL
+            archived_at TEXT NOT NULL,
+            body_preview TEXT
         );
 
         CREATE TABLE IF NOT EXISTS archive_copies (
@@ -356,10 +386,27 @@ def initialize_database(path: Path) -> sqlite3.Connection:
         );
         """
     )
+    migrate_archive_objects(connection)
     migrate_folder_state(connection)
     migrate_audit_events(connection)
     migrate_presence_state(connection)
     return connection
+
+
+def migrate_archive_objects(connection: sqlite3.Connection) -> None:
+    """Add locally cached notification previews without re-reading old mail."""
+
+    columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(archive_objects)"
+        ).fetchall()
+    }
+    if "body_preview" not in columns:
+        with connection:
+            connection.execute(
+                "ALTER TABLE archive_objects ADD COLUMN body_preview TEXT"
+            )
 
 
 def migrate_folder_state(connection: sqlite3.Connection) -> None:
@@ -1013,8 +1060,94 @@ def bounded_header(message, name: str, limit: int = 1000) -> str:
     return text[:limit]
 
 
+def compact_body_text(
+    text: str | None,
+    limit: int = ALERT_BODY_PREVIEW_CHARACTERS,
+) -> str:
+    """Normalize visible message text and return at most ``limit`` characters."""
+
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    printable = "".join(
+        character if character.isprintable() else " "
+        for character in normalized
+    )
+    compact = " ".join(printable.split())
+    return compact[:limit]
+
+
+def normalized_body_preview(text: str | None) -> str:
+    return compact_body_text(text) or BODY_PREVIEW_UNAVAILABLE
+
+
+def decoded_text_part(part) -> str:
+    """Decode one MIME text part while tolerating malformed charset metadata."""
+
+    try:
+        content = part.get_content()
+    except Exception:
+        content = part.get_payload(decode=True)
+        if content is None:
+            content = part.get_payload()
+    if isinstance(content, bytes):
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            return content.decode(charset, errors="replace")
+        except LookupError:
+            return content.decode("utf-8", errors="replace")
+    return str(content or "")
+
+
+def visible_html_text(value: str) -> str:
+    parser = VisibleTextHTMLParser()
+    try:
+        parser.feed(value)
+        parser.close()
+    except Exception:
+        return ""
+    return " ".join(parser.chunks)
+
+
+def parsed_message_body_preview(message) -> str:
+    """Extract visible body text from one parsed email message."""
+
+    html_fallback = ""
+    for part in message.walk():
+        try:
+            if part.is_multipart() or part.get_filename() is not None:
+                continue
+            if part.get_content_disposition() == "attachment":
+                continue
+            content_type = part.get_content_type().lower()
+        except Exception:
+            continue
+        if content_type == "text/plain":
+            preview = compact_body_text(decoded_text_part(part))
+            if preview:
+                return preview
+        elif content_type == "text/html" and not html_fallback:
+            html_fallback = visible_html_text(decoded_text_part(part))
+
+    return compact_body_text(html_fallback) or BODY_PREVIEW_UNAVAILABLE
+
+
+def message_body_preview(raw_message: bytes) -> str:
+    """Extract a short visible body preview, preferring non-attachment plain text."""
+
+    try:
+        message = BytesParser(policy=email.policy.default).parsebytes(raw_message)
+    except Exception:
+        return BODY_PREVIEW_UNAVAILABLE
+    return parsed_message_body_preview(message)
+
+
 def message_metadata(raw_message: bytes, fetch_metadata: bytes) -> MessageMetadata:
-    headers = BytesHeaderParser(policy=email.policy.default).parsebytes(raw_message)
+    try:
+        headers = BytesParser(policy=email.policy.default).parsebytes(raw_message)
+    except Exception:
+        headers = BytesHeaderParser(policy=email.policy.default).parsebytes(raw_message)
+        body_preview = BODY_PREVIEW_UNAVAILABLE
+    else:
+        body_preview = parsed_message_body_preview(headers)
     recipients = ", ".join(
         value for value in (bounded_header(headers, "To"), bounded_header(headers, "Cc")) if value
     )
@@ -1024,6 +1157,7 @@ def message_metadata(raw_message: bytes, fetch_metadata: bytes) -> MessageMetada
         sender=bounded_header(headers, "From"),
         recipients=recipients[:1000],
         subject=bounded_header(headers, "Subject"),
+        body_preview=body_preview,
     )
 
 
@@ -1197,6 +1331,16 @@ def retryable_failure_uids(
     return [int(row["uid"]) for row in rows]
 
 
+def cache_body_preview(
+    database: sqlite3.Connection, sha256: str, body_preview: str
+) -> None:
+    database.execute(
+        "UPDATE archive_objects SET body_preview = ? "
+        "WHERE sha256 = ? AND (body_preview IS NULL OR body_preview = ?)",
+        (body_preview, sha256, BODY_PREVIEW_UNAVAILABLE),
+    )
+
+
 def archive_message(
     database: sqlite3.Connection,
     bucket,
@@ -1214,6 +1358,7 @@ def archive_message(
     if archived_copy_exists(database, sha256, destination_id):
         with database:
             record_occurrence(database, mailbox.key, uidvalidity, uid, sha256, metadata)
+            cache_body_preview(database, sha256, metadata.body_preview)
         LOG.info(
             "Already archived in destination: folder=%s uid=%s sha256=%s",
             mailbox.key,
@@ -1240,10 +1385,10 @@ def archive_message(
 
     with database:
         archived_at = iso_utc()
-        database.execute(
+        archive_insert = database.execute(
             "INSERT OR IGNORE INTO archive_objects("
-            "sha256, object_name, size_bytes, b2_file_id, b2_sha1, archived_at"
-            ") VALUES (?, ?, ?, ?, ?, ?)",
+            "sha256, object_name, size_bytes, b2_file_id, b2_sha1, archived_at, "
+            "body_preview) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 sha256,
                 object_name,
@@ -1251,8 +1396,11 @@ def archive_message(
                 uploaded.id_,
                 uploaded.content_sha1,
                 archived_at,
+                metadata.body_preview,
             ),
         )
+        if archive_insert.rowcount == 0:
+            cache_body_preview(database, sha256, metadata.body_preview)
         database.execute(
             "INSERT INTO archive_copies("
             "sha256, destination_id, object_name, size_bytes, b2_file_id, "
@@ -2045,13 +2193,6 @@ def upload_pending_audit_events(
             break
 
 
-def alert_subject_preview(subject: str | None) -> str:
-    """Return the first 20 normalized characters of the archived Subject header."""
-
-    normalized = " ".join(str(subject or "").replace("\x00", "").split())
-    return normalized[:20] or "Subject unavailable"
-
-
 def send_pushover_message(
     config: dict[str, str], title: str, message: str
 ) -> None:
@@ -2086,12 +2227,9 @@ def send_pending_alerts(
     limit: int = 50,
 ) -> None:
     rows = database.execute(
-        "SELECT events.event_key, ("
-        "SELECT messages.subject FROM imap_messages AS messages "
-        "WHERE messages.sha256 = events.sha256 "
-        "ORDER BY messages.first_seen_at DESC, messages.folder, "
-        "messages.uidvalidity, messages.uid LIMIT 1"
-        ") AS subject FROM audit_events AS events "
+        "SELECT events.event_key, objects.body_preview "
+        "FROM audit_events AS events "
+        "LEFT JOIN archive_objects AS objects ON objects.sha256 = events.sha256 "
         "WHERE events.b2_uploaded_at IS NOT NULL "
         "AND events.alerted_at IS NULL "
         "ORDER BY events.observed_at, events.event_key LIMIT ?",
@@ -2103,7 +2241,7 @@ def send_pending_alerts(
             send_pushover_message(
                 pushover_config,
                 f"YahArch:{paths.account[:7]}",
-                alert_subject_preview(row["subject"]),
+                normalized_body_preview(row["body_preview"]),
             )
             with database:
                 database.execute(

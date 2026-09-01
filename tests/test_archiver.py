@@ -6,6 +6,7 @@ import io
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -97,6 +98,129 @@ class AccountIsolationTests(unittest.TestCase):
         )
 
 
+class MessageBodyPreviewTests(unittest.TestCase):
+    def test_plain_text_is_normalized_and_bounded(self) -> None:
+        body = (
+            "  This is a body preview with extra   whitespace,\n"
+            "controls\x00, and more than fifty characters.  "
+        )
+        raw_message = (
+            b"From: sender@example.invalid\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+            + body.encode("utf-8")
+        )
+
+        preview = archiver.message_body_preview(raw_message)
+
+        self.assertEqual(
+            preview,
+            "This is a body preview with extra whitespace, cont",
+        )
+        self.assertEqual(len(preview), 50)
+
+    def test_multipart_prefers_plain_text_and_ignores_attachments(self) -> None:
+        raw_message = b"\r\n".join(
+            (
+                b"MIME-Version: 1.0",
+                b"Content-Type: multipart/mixed; boundary=outer",
+                b"",
+                b"--outer",
+                b"Content-Type: text/plain; name=decoy.txt",
+                b"Content-Disposition: attachment; filename=decoy.txt",
+                b"",
+                b"Attachment text must not appear.",
+                b"--outer",
+                b"Content-Type: multipart/alternative; boundary=alternative",
+                b"",
+                b"--alternative",
+                b"Content-Type: text/html; charset=utf-8",
+                b"",
+                b"<p>HTML alternative must not win.</p>",
+                b"--alternative",
+                b"Content-Type: text/plain; charset=utf-8",
+                b"",
+                b"Preferred plain body text wins over HTML.",
+                b"--alternative--",
+                b"--outer--",
+                b"",
+            )
+        )
+
+        self.assertEqual(
+            archiver.message_body_preview(raw_message),
+            "Preferred plain body text wins over HTML.",
+        )
+
+    def test_html_fallback_keeps_only_visible_text(self) -> None:
+        raw_message = b"\r\n".join(
+            (
+                b"MIME-Version: 1.0",
+                b"Content-Type: text/html; charset=utf-8",
+                b"",
+                b"<html><head><style>hidden css</style></head>",
+                b"<body>Hello&nbsp;<b>team</b> &amp; welcome.",
+                b"<script>hidden script</script></body></html>",
+            )
+        )
+
+        self.assertEqual(
+            archiver.message_body_preview(raw_message),
+            "Hello team & welcome.",
+        )
+
+    def test_new_archive_object_caches_body_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connection = archiver.initialize_database(
+                Path(directory) / "body-preview.sqlite3"
+            )
+            paths = replace(
+                archiver.runtime_paths("personal"),
+                temp_directory=Path(directory) / "tmp",
+            )
+            mailbox = archiver.Mailbox("INBOX", '"INBOX"', frozenset())
+            raw_message = (
+                b"Subject: Test\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+                b"This newly fetched body is cached for later alerts."
+            )
+            bucket = mock.Mock()
+
+            def upload(local_path, object_name, **kwargs):
+                data = Path(local_path).read_bytes()
+                return mock.Mock(
+                    id_="file-1",
+                    content_sha1=kwargs["sha1_sum"],
+                    file_name=object_name,
+                    size=len(data),
+                    file_info=kwargs["file_info"],
+                )
+
+            bucket.upload_local_file.side_effect = upload
+            try:
+                uploaded = archiver.archive_message(
+                    connection,
+                    bucket,
+                    paths,
+                    mailbox,
+                    77,
+                    1,
+                    b'INTERNALDATE "01-Sep-2026 00:00:00 +0000"',
+                    raw_message,
+                    "destination-1",
+                )
+
+                row = connection.execute(
+                    "SELECT body_preview FROM archive_objects"
+                ).fetchone()
+                self.assertTrue(uploaded)
+                self.assertEqual(
+                    row["body_preview"],
+                    "This newly fetched body is cached for later alerts",
+                )
+            finally:
+                connection.close()
+
+
 class DatabaseTests(unittest.TestCase):
     def test_database_uses_rollback_journal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -134,6 +258,41 @@ class DatabaseTests(unittest.TestCase):
                 self.assertEqual(row["live_cursor_uid"], 42)
                 self.assertEqual(row["backfill_before_uid"], 1)
                 self.assertEqual(row["backfill_complete"], 1)
+            finally:
+                connection.close()
+
+    def test_legacy_archive_objects_add_body_preview_without_data_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "legacy-archive.sqlite3"
+            legacy = sqlite3.connect(database_path)
+            legacy.execute(
+                "CREATE TABLE archive_objects ("
+                "sha256 TEXT PRIMARY KEY, object_name TEXT NOT NULL UNIQUE, "
+                "size_bytes INTEGER NOT NULL, b2_file_id TEXT NOT NULL, "
+                "b2_sha1 TEXT NOT NULL, archived_at TEXT NOT NULL)"
+            )
+            legacy.execute(
+                "INSERT INTO archive_objects VALUES "
+                "(?, 'mail/object.eml', 10, 'file-1', ?, 'old')",
+                ("a" * 64, "b" * 40),
+            )
+            legacy.commit()
+            legacy.close()
+
+            connection = archiver.initialize_database(database_path)
+            try:
+                columns = {
+                    row["name"]
+                    for row in connection.execute(
+                        "PRAGMA table_info(archive_objects)"
+                    ).fetchall()
+                }
+                row = connection.execute(
+                    "SELECT object_name, body_preview FROM archive_objects"
+                ).fetchone()
+                self.assertIn("body_preview", columns)
+                self.assertEqual(row["object_name"], "mail/object.eml")
+                self.assertIsNone(row["body_preview"])
             finally:
                 connection.close()
 
@@ -221,7 +380,9 @@ class DatabaseTests(unittest.TestCase):
             try:
                 with connection:
                     connection.execute(
-                        "INSERT INTO archive_objects VALUES "
+                        "INSERT INTO archive_objects("
+                        "sha256, object_name, size_bytes, b2_file_id, b2_sha1, "
+                        "archived_at) VALUES "
                         "(?, 'mail/object.eml', 10, 'file-1', ?, 'now')",
                         (sha256, "b" * 40),
                     )
@@ -1213,24 +1374,22 @@ class PresenceReconciliationTests(unittest.TestCase):
 
 
 class AlertFormattingTests(unittest.TestCase):
-    def test_compact_alert_uses_account_prefix_and_subject_preview(self) -> None:
+    def test_compact_alert_uses_account_prefix_and_body_preview(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connection = archiver.initialize_database(
                 Path(directory) / "compact-alert.sqlite3"
             )
             sha256 = "c" * 64
-            subject = "Password reset for important account"
+            body = "Missing email body with enough text to exceed fifty characters."
+            stored_body = f"  {body.replace(' ', '   ')}  "
             try:
                 with connection:
                     connection.execute(
-                        "INSERT INTO archive_objects VALUES "
-                        "(?, 'mail/object.eml', 10, 'file-1', ?, 'now')",
-                        (sha256, "d" * 40),
-                    )
-                    connection.execute(
-                        "INSERT INTO imap_messages VALUES "
-                        "('INBOX', 77, 1, ?, 'now', '', '', '', ?, 'now')",
-                        (sha256, f"  {subject.replace(' ', '   ')}  "),
+                        "INSERT INTO archive_objects("
+                        "sha256, object_name, size_bytes, b2_file_id, b2_sha1, "
+                        "archived_at, body_preview) VALUES "
+                        "(?, 'mail/object.eml', 10, 'file-1', ?, 'now', ?)",
+                        (sha256, "d" * 40, stored_body),
                     )
                     archiver.record_audit_event(
                         connection,
@@ -1269,7 +1428,7 @@ class AlertFormattingTests(unittest.TestCase):
                 send.assert_called_once_with(
                     config,
                     "YahArch:amanda-",
-                    subject[:20],
+                    body[:50],
                 )
                 self.assertEqual(
                     sum(
@@ -1279,8 +1438,8 @@ class AlertFormattingTests(unittest.TestCase):
                     1,
                 )
                 self.assertEqual(
-                    archiver.alert_subject_preview(None),
-                    "Subject unavailable",
+                    archiver.normalized_body_preview(None),
+                    "Body unavailable",
                 )
                 self.assertIsNotNone(
                     connection.execute(
