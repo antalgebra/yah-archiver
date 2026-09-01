@@ -54,6 +54,8 @@ LIST_PATTERN = re.compile(
     rb"^\((?P<flags>[^)]*)\)\s+(?P<delimiter>NIL|\"(?:\\.|[^\"])*\")\s+(?P<name>.+)$"
 )
 INTERNAL_DATE_PATTERN = re.compile(rb'INTERNALDATE "(?P<value>[^"]+)"', re.IGNORECASE)
+JUNK_FLAGS = frozenset({"\\JUNK", "\\SPAM"})
+JUNK_FOLDER_NAMES = frozenset({"BULK", "BULK MAIL", "JUNK", "JUNK MAIL", "SPAM"})
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,7 @@ class MailboxScan:
     uidvalidity: int
     current_uids: tuple[int, ...]
     is_trash: bool
+    is_junk: bool
 
 
 class ImapCommandError(RuntimeError):
@@ -285,6 +288,7 @@ def initialize_database(path: Path) -> sqlite3.Connection:
             folder TEXT PRIMARY KEY,
             uidvalidity INTEGER NOT NULL,
             is_trash INTEGER NOT NULL CHECK (is_trash IN (0, 1)),
+            is_junk INTEGER NOT NULL DEFAULT 0 CHECK (is_junk IN (0, 1)),
             present INTEGER NOT NULL CHECK (present IN (0, 1)),
             first_seen_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL,
@@ -298,6 +302,7 @@ def initialize_database(path: Path) -> sqlite3.Connection:
             uid INTEGER NOT NULL,
             sha256 TEXT,
             is_trash INTEGER NOT NULL CHECK (is_trash IN (0, 1)),
+            is_junk INTEGER NOT NULL DEFAULT 0 CHECK (is_junk IN (0, 1)),
             present INTEGER NOT NULL CHECK (present IN (0, 1)),
             first_seen_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL,
@@ -340,6 +345,7 @@ def initialize_database(path: Path) -> sqlite3.Connection:
     )
     migrate_folder_state(connection)
     migrate_audit_events(connection)
+    migrate_presence_state(connection)
     return connection
 
 
@@ -390,6 +396,29 @@ def migrate_audit_events(connection: sqlite3.Connection) -> None:
                 )
 
 
+def migrate_presence_state(connection: sqlite3.Connection) -> None:
+    """Add durable junk classification without resetting presence history."""
+
+    with connection:
+        for table in ("presence_folders", "message_presence"):
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    f"PRAGMA table_info({table})"
+                ).fetchall()
+            }
+            if "is_junk" not in columns:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN is_junk "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK (is_junk IN (0, 1))"
+                )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS message_presence_junk_sha_idx "
+            "ON message_presence(sha256) "
+            "WHERE is_junk = 1 AND sha256 IS NOT NULL"
+        )
+
+
 def create_b2_client(config: dict[str, str], source: Path):
     # Keep the optional third-party dependency out of argument parsing and tests.
     from b2sdk.v3 import AuthInfoCache, B2Api, InMemoryAccountInfo
@@ -409,19 +438,14 @@ def mailbox_is_trash(mailbox: Mailbox) -> bool:
     return "\\TRASH" in mailbox.flags or upper_name == "TRASH"
 
 
-def folder_name_is_ignored(folder: str) -> bool:
-    """Return True for spam/bulk folders that are outside archive scope."""
+def folder_name_is_junk(folder: str) -> bool:
+    """Recognize common Yahoo spam folder names when flags are incomplete."""
 
-    upper_name = folder.upper()
-    return any(marker in upper_name for marker in ("BULK", "SPAM", "JUNK"))
+    return folder.strip().upper() in JUNK_FOLDER_NAMES
 
 
-def mailbox_is_ignored(mailbox: Mailbox) -> bool:
-    return (
-        "\\JUNK" in mailbox.flags
-        or "\\SPAM" in mailbox.flags
-        or folder_name_is_ignored(mailbox.key)
-    )
+def mailbox_is_junk(mailbox: Mailbox) -> bool:
+    return bool(mailbox.flags & JUNK_FLAGS) or folder_name_is_junk(mailbox.key)
 
 
 def health_value(database: sqlite3.Connection, key: str) -> str | None:
@@ -500,6 +524,148 @@ def archived_message_sha256(
     return None if row is None else str(row["sha256"])
 
 
+def content_was_observed_in_junk(
+    database: sqlite3.Connection, sha256: str | None
+) -> bool:
+    """Return whether this archived content ever appeared in Spam/Junk."""
+
+    if not sha256:
+        return False
+    return (
+        database.execute(
+            "SELECT 1 FROM message_presence "
+            "WHERE sha256 = ? AND is_junk = 1 LIMIT 1",
+            (sha256,),
+        ).fetchone()
+        is not None
+    )
+
+
+def content_is_currently_present(
+    database: sqlite3.Connection, sha256: str | None
+) -> bool:
+    if not sha256:
+        return False
+    return (
+        database.execute(
+            "SELECT 1 FROM message_presence "
+            "WHERE sha256 = ? AND present = 1 LIMIT 1",
+            (sha256,),
+        ).fetchone()
+        is not None
+    )
+
+
+def suppress_junk_related_pending_alerts(
+    database: sqlite3.Connection, suppressed_at: str
+) -> None:
+    """Silence legacy queued alerts once their content is linked to junk."""
+
+    database.execute(
+        "UPDATE audit_events SET alerted_at = ?, "
+        "last_alert_error = 'suppressed: content observed in spam/junk' "
+        "WHERE alerted_at IS NULL "
+        "AND event_type IN ("
+        "'unexplained_disappearance', 'trash_observed', 'trash_disappeared'"
+        ") AND sha256 IS NOT NULL AND sha256 IN ("
+        "SELECT sha256 FROM message_presence "
+        "WHERE is_junk = 1 AND sha256 IS NOT NULL"
+        ")",
+        (suppressed_at,),
+    )
+
+
+def upsert_presence_folder(
+    database: sqlite3.Connection, scan: MailboxScan, observed_at: str
+) -> None:
+    """Record a scanned folder and retain durable junk lineage."""
+
+    if scan.is_junk:
+        database.execute(
+            "UPDATE message_presence SET is_junk = 1 "
+            "WHERE folder = ? AND is_junk = 0",
+            (scan.folder,),
+        )
+    database.execute(
+        "INSERT INTO presence_folders("
+        "folder, uidvalidity, is_trash, is_junk, present, first_seen_at, "
+        "last_seen_at, missing_clean_scans, disappeared_at"
+        ") VALUES (?, ?, ?, ?, 1, ?, ?, 0, NULL) "
+        "ON CONFLICT(folder) DO UPDATE SET "
+        "uidvalidity = excluded.uidvalidity, "
+        "is_trash = excluded.is_trash, is_junk = excluded.is_junk, "
+        "present = 1, last_seen_at = excluded.last_seen_at, "
+        "missing_clean_scans = 0, disappeared_at = NULL",
+        (
+            scan.folder,
+            scan.uidvalidity,
+            int(scan.is_trash),
+            int(scan.is_junk),
+            observed_at,
+            observed_at,
+        ),
+    )
+
+
+def upsert_message_presence(
+    database: sqlite3.Connection,
+    scan: MailboxScan,
+    uid: int,
+    sha256: str | None,
+    observed_at: str,
+) -> None:
+    database.execute(
+        "INSERT INTO message_presence("
+        "folder, uidvalidity, uid, sha256, is_trash, is_junk, present, "
+        "first_seen_at, last_seen_at, missing_clean_scans, disappeared_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 0, NULL) "
+        "ON CONFLICT(folder, uidvalidity, uid) DO UPDATE SET "
+        "sha256 = COALESCE(excluded.sha256, message_presence.sha256), "
+        "is_trash = excluded.is_trash, is_junk = excluded.is_junk, "
+        "present = 1, last_seen_at = excluded.last_seen_at, "
+        "missing_clean_scans = 0, disappeared_at = NULL",
+        (
+            scan.folder,
+            scan.uidvalidity,
+            uid,
+            sha256,
+            int(scan.is_trash),
+            int(scan.is_junk),
+            observed_at,
+            observed_at,
+        ),
+    )
+
+
+def record_actionable_trash_arrival(
+    database: sqlite3.Connection,
+    paths: RuntimePaths,
+    scan: MailboxScan,
+    uid: int,
+    sha256: str | None,
+    observed_at: str,
+) -> None:
+    if content_was_observed_in_junk(database, sha256):
+        return
+    record_audit_event(
+        database,
+        f"trash_observed:{scan.folder}:{scan.uidvalidity}:{uid}",
+        "trash_observed",
+        observed_at,
+        scan.folder,
+        scan.uidvalidity,
+        uid,
+        sha256,
+        {
+            "account": paths.account,
+            "meaning": (
+                "A UID appeared in Yahoo Trash after the baseline. "
+                "This does not identify who moved it."
+            ),
+        },
+    )
+
+
 def unquote_imap_bytes(token: bytes) -> bytes:
     token = token.strip()
     if len(token) >= 2 and token.startswith(b'"') and token.endswith(b'"'):
@@ -545,6 +711,7 @@ def mailbox_is_priority(mailbox: Mailbox) -> bool:
     upper_name = mailbox.key.upper()
     return (
         mailbox_is_trash(mailbox)
+        or mailbox_is_junk(mailbox)
         or upper_name == "INBOX"
         or "\\SENT" in mailbox.flags
         or upper_name in {"SENT", "SENT ITEMS"}
@@ -555,12 +722,14 @@ def mailbox_priority_order(mailbox: Mailbox) -> tuple[int, str]:
     upper_name = mailbox.key.upper()
     if mailbox_is_trash(mailbox):
         rank = 0
-    elif upper_name == "INBOX":
+    elif mailbox_is_junk(mailbox):
         rank = 1
-    elif "\\SENT" in mailbox.flags or upper_name in {"SENT", "SENT ITEMS"}:
+    elif upper_name == "INBOX":
         rank = 2
-    else:
+    elif "\\SENT" in mailbox.flags or upper_name in {"SENT", "SENT ITEMS"}:
         rank = 3
+    else:
+        rank = 4
     return rank, upper_name
 
 
@@ -574,7 +743,7 @@ def list_selectable_mailboxes(client: imaplib.IMAP4_SSL) -> list[Mailbox]:
         if not isinstance(line, bytes):
             raise RuntimeError(f"Unexpected IMAP LIST response: {line!r}")
         mailbox = parse_mailbox_list_line(line)
-        if mailbox is not None and not mailbox_is_ignored(mailbox):
+        if mailbox is not None:
             mailboxes.append(mailbox)
 
     return sorted(mailboxes, key=mailbox_priority_order)
@@ -1048,25 +1217,26 @@ def attempt_message(
                     False,
                     "UID was visible in SEARCH but absent during FETCH",
                 )
-                record_audit_event(
-                    database,
-                    f"message_disappeared_before_fetch:{mailbox.key}:"
-                    f"{uidvalidity}:{uid}",
-                    "message_disappeared_before_fetch",
-                    observed_at,
-                    mailbox.key,
-                    uidvalidity,
-                    uid,
-                    None,
-                    {
-                        "account": paths.account,
-                        "meaning": (
-                            "The UID was visible during SEARCH but its RFC822 "
-                            "content was unavailable during FETCH. Cause and actor "
-                            "cannot be determined from IMAP."
-                        ),
-                    },
-                )
+                if not mailbox_is_junk(mailbox):
+                    record_audit_event(
+                        database,
+                        f"message_disappeared_before_fetch:{mailbox.key}:"
+                        f"{uidvalidity}:{uid}",
+                        "message_disappeared_before_fetch",
+                        observed_at,
+                        mailbox.key,
+                        uidvalidity,
+                        uid,
+                        None,
+                        {
+                            "account": paths.account,
+                            "meaning": (
+                                "The UID was visible during SEARCH but its RFC822 "
+                                "content was unavailable during FETCH. Cause and "
+                                "actor cannot be determined from IMAP."
+                            ),
+                        },
+                    )
             LOG.warning(
                 "Message disappeared before fetch: folder=%s uid=%s",
                 mailbox.key,
@@ -1266,6 +1436,7 @@ def archive_mailbox(
                 uidvalidity=uidvalidity,
                 current_uids=tuple(current_uids),
                 is_trash=mailbox_is_trash(mailbox),
+                is_junk=mailbox_is_junk(mailbox),
             )
         )
     return attempted, uploaded
@@ -1280,6 +1451,7 @@ def reconcile_presence(
 
     observed_at = iso_utc()
     baseline_exists = health_value(database, "presence_baseline_complete") == "1"
+    trash_arrivals: list[tuple[MailboxScan, int, str | None]] = []
     observed_folders = {scan.folder for scan in scans}
     reset_folders: set[str] = set()
 
@@ -1302,50 +1474,35 @@ def reconcile_presence(
                 and int(previous["uidvalidity"]) != scan.uidvalidity
             ):
                 old_uidvalidity = int(previous["uidvalidity"])
-                record_audit_event(
-                    database,
-                    f"uidvalidity_changed:{scan.folder}:{old_uidvalidity}:"
-                    f"{scan.uidvalidity}",
-                    "uidvalidity_changed",
-                    observed_at,
-                    scan.folder,
-                    scan.uidvalidity,
-                    None,
-                    None,
-                    {
-                        "account": paths.account,
-                        "old_uidvalidity": old_uidvalidity,
-                        "new_uidvalidity": scan.uidvalidity,
-                        "meaning": (
-                            "The folder UID namespace changed. Per-message "
-                            "deletion conclusions were suppressed for this reset."
-                        ),
-                    },
-                )
+                if not scan.is_junk and not bool(previous["is_junk"]):
+                    record_audit_event(
+                        database,
+                        f"uidvalidity_changed:{scan.folder}:{old_uidvalidity}:"
+                        f"{scan.uidvalidity}",
+                        "uidvalidity_changed",
+                        observed_at,
+                        scan.folder,
+                        scan.uidvalidity,
+                        None,
+                        None,
+                        {
+                            "account": paths.account,
+                            "old_uidvalidity": old_uidvalidity,
+                            "new_uidvalidity": scan.uidvalidity,
+                            "meaning": (
+                                "The folder UID namespace changed. Per-message "
+                                "deletion conclusions were suppressed for this "
+                                "reset."
+                            ),
+                        },
+                    )
                 database.execute(
                     "UPDATE message_presence SET present = 0, disappeared_at = ? "
                     "WHERE folder = ? AND uidvalidity = ? AND present = 1",
                     (observed_at, scan.folder, old_uidvalidity),
                 )
 
-            database.execute(
-                "INSERT INTO presence_folders("
-                "folder, uidvalidity, is_trash, present, first_seen_at, "
-                "last_seen_at, missing_clean_scans, disappeared_at"
-                ") VALUES (?, ?, ?, 1, ?, ?, 0, NULL) "
-                "ON CONFLICT(folder) DO UPDATE SET "
-                "uidvalidity = excluded.uidvalidity, "
-                "is_trash = excluded.is_trash, present = 1, "
-                "last_seen_at = excluded.last_seen_at, "
-                "missing_clean_scans = 0, disappeared_at = NULL",
-                (
-                    scan.folder,
-                    scan.uidvalidity,
-                    int(scan.is_trash),
-                    observed_at,
-                    observed_at,
-                ),
-            )
+            upsert_presence_folder(database, scan, observed_at)
 
         for folder, previous in previous_folders.items():
             if folder in observed_folders or not bool(previous["present"]):
@@ -1369,7 +1526,7 @@ def reconcile_presence(
                 "WHERE folder = ? AND present = 1",
                 (observed_at, folder),
             )
-            if baseline_exists:
+            if baseline_exists and not bool(previous["is_junk"]):
                 record_audit_event(
                     database,
                     f"folder_disappeared:{folder}:{previous['uidvalidity']}",
@@ -1403,50 +1560,21 @@ def reconcile_presence(
                     database, scan.folder, scan.uidvalidity, uid
                 )
                 previous = prior_messages.get(uid)
-                database.execute(
-                    "INSERT INTO message_presence("
-                    "folder, uidvalidity, uid, sha256, is_trash, present, "
-                    "first_seen_at, last_seen_at, missing_clean_scans, "
-                    "disappeared_at"
-                    ") VALUES (?, ?, ?, ?, ?, 1, ?, ?, 0, NULL) "
-                    "ON CONFLICT(folder, uidvalidity, uid) DO UPDATE SET "
-                    "sha256 = COALESCE(excluded.sha256, message_presence.sha256), "
-                    "is_trash = excluded.is_trash, present = 1, "
-                    "last_seen_at = excluded.last_seen_at, "
-                    "missing_clean_scans = 0, disappeared_at = NULL",
-                    (
-                        scan.folder,
-                        scan.uidvalidity,
-                        uid,
-                        sha256,
-                        int(scan.is_trash),
-                        observed_at,
-                        observed_at,
-                    ),
-                )
+                upsert_message_presence(database, scan, uid, sha256, observed_at)
                 if (
                     baseline_exists
                     and previous is None
                     and scan.is_trash
                     and scan.folder not in reset_folders
                 ):
-                    record_audit_event(
-                        database,
-                        f"trash_observed:{scan.folder}:{scan.uidvalidity}:{uid}",
-                        "trash_observed",
-                        observed_at,
-                        scan.folder,
-                        scan.uidvalidity,
-                        uid,
-                        sha256,
-                        {
-                            "account": paths.account,
-                            "meaning": (
-                                "A UID appeared in Yahoo Trash after the baseline. "
-                                "This does not identify who moved it."
-                            ),
-                        },
-                    )
+                    trash_arrivals.append((scan, uid, sha256))
+
+        # Evaluate Trash only after every folder in this snapshot is present in
+        # SQLite, so correlation does not depend on Yahoo's folder ordering.
+        for scan, uid, sha256 in trash_arrivals:
+            record_actionable_trash_arrival(
+                database, paths, scan, uid, sha256, observed_at
+            )
 
         for scan in scans:
             visible_uids = set(scan.current_uids)
@@ -1481,7 +1609,11 @@ def reconcile_presence(
                     ),
                 )
                 sha256 = None if row["sha256"] is None else str(row["sha256"])
+                if bool(row["is_junk"]) or scan.is_junk:
+                    continue
                 if bool(row["is_trash"]):
+                    if content_was_observed_in_junk(database, sha256):
+                        continue
                     event_type = "trash_disappeared"
                     meaning = (
                         "The UID was absent from Yahoo Trash in two complete "
@@ -1489,17 +1621,11 @@ def reconcile_presence(
                         "IMAP does not identify the actor."
                     )
                 else:
-                    same_content_present = False
-                    if sha256:
-                        same_content_present = (
-                            database.execute(
-                                "SELECT 1 FROM message_presence "
-                                "WHERE sha256 = ? AND present = 1 LIMIT 1",
-                                (sha256,),
-                            ).fetchone()
-                            is not None
-                        )
-                    if same_content_present:
+                    if content_is_currently_present(
+                        database, sha256
+                    ) or content_was_observed_in_junk(
+                        database, sha256
+                    ):
                         continue
                     event_type = "unexplained_disappearance"
                     meaning = (
@@ -1525,6 +1651,7 @@ def reconcile_presence(
                     },
                 )
 
+        suppress_junk_related_pending_alerts(database, observed_at)
         set_health(database, "presence_baseline_complete", "1")
         set_health(database, "last_successful_presence_scan", observed_at)
 
@@ -1538,6 +1665,7 @@ def observe_priority_arrivals(
 
     observed_at = iso_utc()
     baseline_exists = health_value(database, "presence_baseline_complete") == "1"
+    trash_arrivals: list[tuple[MailboxScan, int, str | None]] = []
 
     with database:
         for scan in scans:
@@ -1550,29 +1678,20 @@ def observe_priority_arrivals(
                 or int(previous_folder["uidvalidity"]) != scan.uidvalidity
             )
             if folder_reset:
-                database.execute(
-                    "DELETE FROM message_presence WHERE folder = ?",
-                    (scan.folder,),
-                )
+                if scan.is_junk:
+                    database.execute(
+                        "UPDATE message_presence SET present = 0, "
+                        "disappeared_at = COALESCE(disappeared_at, ?) "
+                        "WHERE folder = ? AND present = 1",
+                        (observed_at, scan.folder),
+                    )
+                else:
+                    database.execute(
+                        "DELETE FROM message_presence WHERE folder = ?",
+                        (scan.folder,),
+                    )
 
-            database.execute(
-                "INSERT INTO presence_folders("
-                "folder, uidvalidity, is_trash, present, first_seen_at, "
-                "last_seen_at, missing_clean_scans, disappeared_at"
-                ") VALUES (?, ?, ?, 1, ?, ?, 0, NULL) "
-                "ON CONFLICT(folder) DO UPDATE SET "
-                "uidvalidity = excluded.uidvalidity, "
-                "is_trash = excluded.is_trash, present = 1, "
-                "last_seen_at = excluded.last_seen_at, "
-                "missing_clean_scans = 0, disappeared_at = NULL",
-                (
-                    scan.folder,
-                    scan.uidvalidity,
-                    int(scan.is_trash),
-                    observed_at,
-                    observed_at,
-                ),
-            )
+            upsert_presence_folder(database, scan, observed_at)
 
             prior_uids = {
                 int(row["uid"])
@@ -1586,51 +1705,21 @@ def observe_priority_arrivals(
                 sha256 = archived_message_sha256(
                     database, scan.folder, scan.uidvalidity, uid
                 )
-                database.execute(
-                    "INSERT INTO message_presence("
-                    "folder, uidvalidity, uid, sha256, is_trash, present, "
-                    "first_seen_at, last_seen_at, missing_clean_scans, "
-                    "disappeared_at"
-                    ") VALUES (?, ?, ?, ?, ?, 1, ?, ?, 0, NULL) "
-                    "ON CONFLICT(folder, uidvalidity, uid) DO UPDATE SET "
-                    "sha256 = COALESCE(excluded.sha256, message_presence.sha256), "
-                    "is_trash = excluded.is_trash, present = 1, "
-                    "last_seen_at = excluded.last_seen_at, "
-                    "missing_clean_scans = 0, disappeared_at = NULL",
-                    (
-                        scan.folder,
-                        scan.uidvalidity,
-                        uid,
-                        sha256,
-                        int(scan.is_trash),
-                        observed_at,
-                        observed_at,
-                    ),
-                )
+                upsert_message_presence(database, scan, uid, sha256, observed_at)
                 if (
                     baseline_exists
                     and scan.is_trash
                     and not folder_reset
                     and uid not in prior_uids
                 ):
-                    record_audit_event(
-                        database,
-                        f"trash_observed:{scan.folder}:{scan.uidvalidity}:{uid}",
-                        "trash_observed",
-                        observed_at,
-                        scan.folder,
-                        scan.uidvalidity,
-                        uid,
-                        sha256,
-                        {
-                            "account": paths.account,
-                            "meaning": (
-                                "A UID appeared in Yahoo Trash after the baseline. "
-                                "This does not identify who moved it."
-                            ),
-                        },
-                    )
+                    trash_arrivals.append((scan, uid, sha256))
 
+        for scan, uid, sha256 in trash_arrivals:
+            record_actionable_trash_arrival(
+                database, paths, scan, uid, sha256, observed_at
+            )
+
+        suppress_junk_related_pending_alerts(database, observed_at)
         set_health(database, "last_successful_priority_presence_scan", observed_at)
 
 
@@ -1860,48 +1949,6 @@ def apply_archive_scope(database: sqlite3.Connection, archive_after: date) -> No
         set_health(database, "archive_after", configured_value)
 
 
-def suppress_ignored_folder_state(database: sqlite3.Connection) -> None:
-    """Remove active spam state and silence already-queued spam alerts."""
-
-    folders = {
-        str(row["folder"])
-        for row in database.execute(
-            "SELECT folder FROM presence_folders "
-            "UNION SELECT folder FROM message_presence "
-            "UNION SELECT folder FROM message_failures "
-            "UNION SELECT folder FROM folder_state "
-            "UNION SELECT folder FROM audit_events WHERE folder IS NOT NULL"
-        ).fetchall()
-        if row["folder"] is not None and folder_name_is_ignored(str(row["folder"]))
-    }
-    if not folders:
-        return
-
-    suppressed_at = iso_utc()
-    with database:
-        for folder in folders:
-            database.execute("DELETE FROM message_presence WHERE folder = ?", (folder,))
-            database.execute("DELETE FROM presence_folders WHERE folder = ?", (folder,))
-            database.execute("DELETE FROM message_failures WHERE folder = ?", (folder,))
-            database.execute("DELETE FROM folder_state WHERE folder = ?", (folder,))
-            # Events that never reached immutable storage were false positives
-            # from folders now explicitly outside the archive scope.
-            database.execute(
-                "DELETE FROM audit_events "
-                "WHERE folder = ? AND b2_uploaded_at IS NULL",
-                (folder,),
-            )
-            # Preserve already-uploaded evidence records but prevent any queued
-            # Pushover notification for those ignored folders.
-            database.execute(
-                "UPDATE audit_events SET alerted_at = ?, "
-                "last_alert_error = 'suppressed: ignored spam folder' "
-                "WHERE folder = ? AND b2_uploaded_at IS NOT NULL "
-                "AND alerted_at IS NULL",
-                (suppressed_at, folder),
-            )
-
-
 def archive_cycle(
     client: imaplib.IMAP4_SSL,
     database: sqlite3.Connection,
@@ -2093,7 +2140,6 @@ def run(argv: list[str]) -> int:
     destination_id = str(bucket.id_)
     initialize_archive_destination(database, destination_id)
     apply_archive_scope(database, archive_after)
-    suppress_ignored_folder_state(database)
     LOG.info(
         "B2 authorization succeeded: account=%s bucket=%s destination=%s "
         "prefix=%s archive-since=%s",

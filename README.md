@@ -11,9 +11,10 @@ This repository owns two related guarantees:
 Deletion evidence shares the collector's coherent IMAP scan but has separate
 state and health timestamps. Evidence is stored in SQLite and copied to the
 Object-Locked B2 bucket. After that upload succeeds, a generic Pushover alert is
-sent without exposing message subjects or bodies. A
-later `yah-archive-ops` project will provide B2 verification and a copy-only
-OneDrive mirror; `yah-archive-crawler` will provide read-only analysis.
+sent without exposing message subjects or bodies. The companion
+`yah-archive-ops` project monitors archive health, `yah-deleted-onedrive`
+provides a copy-only OneDrive mirror, and `yah-archive-crawler` is reserved for
+read-only analysis.
 
 ## Safety model
 
@@ -21,8 +22,8 @@ OneDrive mirror; `yah-archive-crawler` will provide read-only analysis.
   file, SQLite catalog, temporary directory, and B2 namespace.
 - Yahoo IMAP is used only for `LIST`, read-only `SELECT`, date-limited
   `UID SEARCH`, and `UID FETCH` operations.
-- Yahoo Bulk/Spam/Junk folders are excluded before selection, so their messages
-  are not searched, downloaded, cataloged, or monitored for deletion.
+- Yahoo Bulk/Spam/Junk folders are searched, archived, and tracked as quarantine
+  folders. Their arrivals and disappearances do not generate deletion alerts.
 - The archiver never marks, moves, deletes, or expunges Yahoo messages.
 - A message is recorded in SQLite only after B2 accepts and verifies its upload.
 - Removing a message from Yahoo never removes its archived B2 object.
@@ -35,8 +36,8 @@ OneDrive mirror; `yah-archive-crawler` will provide read-only analysis.
   memory instead of rereading the staged file before each upload.
 
 This remains a best-effort IMAP archive: no poller can recover a message that is
-permanently deleted before its first successful fetch. Do not connect production
-Yahoo accounts until deletion-evidence and alerting work is complete.
+permanently deleted before its first successful fetch. Keep external health
+monitoring enabled so IMAP, B2, or notification failures are surfaced promptly.
 
 ## Catch-up behavior
 
@@ -45,12 +46,14 @@ Yahoo accounts until deletion-evidence and alerting work is complete.
 - Changing the cutoff resets only live scan/presence state, preventing older
   catalog entries from creating disappearance alerts. Existing B2 objects and
   durable catalog history are retained.
-- Trash is scanned first, followed by Inbox, Sent, and other folders.
+- Trash is scanned first, followed by Bulk/Spam/Junk, Inbox, Sent, and other
+  folders.
 - On the first scan of a folder, existing messages are archived newest first.
 - Historical catch-up is limited to `BACKFILL_BATCH_SIZE` messages per folder per
   cycle (default `10`), so the service returns quickly to checking for new mail.
-- Inbox, Sent, and Trash are scanned every `POLL_SECONDS` (default `5`
-  seconds). New Trash arrivals are recorded and alerted from these rapid scans.
+- Inbox, Sent, Trash, and Bulk/Spam/Junk are scanned every `POLL_SECONDS`
+  (default `5` seconds). New Trash arrivals are recorded and alerted from these
+  rapid scans unless the same content was previously observed in Spam/Junk.
 - All other included folders and complete disappearance reconciliation run every
   `FULL_SCAN_SECONDS` (default `60` seconds).
 - The IMAP folder list is cached between full scans instead of being requested
@@ -67,13 +70,22 @@ Yahoo accounts until deletion-evidence and alerting work is complete.
 
 - The first complete scan establishes a baseline without generating a flood of
   historical Trash events.
-- A new UID appearing in Trash creates a `trash_observed` event.
+- A new UID appearing in Trash creates a `trash_observed` event unless the same
+  content was previously observed in Spam/Junk.
+- Spam/Junk arrivals, disappearances, folder resets, and folder disappearance do
+  not create alerts.
 - A missing message is not classified until it is absent from two complete,
   successful scans.
-- A confirmed disappearance from Trash creates `trash_disappeared`.
+- A confirmed disappearance from Trash creates `trash_disappeared` unless the
+  same content was previously observed in Spam/Junk.
 - A confirmed disappearance from another folder creates
   `unexplained_disappearance` only when the same archived content is not visible
-  in another current folder.
+  in another current folder and has never been observed in Spam/Junk.
+- Once content has been observed in Spam/Junk, later Spam or Trash deletion is
+  treated as non-actionable. This suppresses the complete
+  `Inbox -> Spam/Junk -> deleted` path while retaining ordinary deletion alerts.
+- Previously queued, unsent disappearance or Trash alerts are suppressed when a
+  later Spam/Junk scan correlates the same SHA-256 content.
 - Folder disappearance and UIDVALIDITY reset have their own events and suppress
   mass per-message conclusions.
 - Events describe observable facts only. IMAP cannot establish who acted, and a
