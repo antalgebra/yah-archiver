@@ -1374,6 +1374,80 @@ class PresenceReconciliationTests(unittest.TestCase):
 
 
 class AlertFormattingTests(unittest.TestCase):
+    def test_non_actionable_and_previewless_events_are_suppressed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connection = archiver.initialize_database(
+                Path(directory) / "suppressed-alerts.sqlite3"
+            )
+            sha256 = "a" * 64
+            try:
+                with connection:
+                    connection.execute(
+                        "INSERT INTO archive_objects("
+                        "sha256, object_name, size_bytes, b2_file_id, b2_sha1, "
+                        "archived_at, body_preview) VALUES "
+                        "(?, 'mail/legacy.eml', 10, 'file-1', ?, 'now', NULL)",
+                        (sha256, "b" * 40),
+                    )
+                    archiver.record_audit_event(
+                        connection,
+                        "legacy-message",
+                        "unexplained_disappearance",
+                        "2026-09-01T00:00:00+00:00",
+                        "INBOX",
+                        77,
+                        1,
+                        sha256,
+                        {"account": "personal"},
+                    )
+                    archiver.record_audit_event(
+                        connection,
+                        "folder-reset",
+                        "uidvalidity_changed",
+                        "2026-09-01T00:00:01+00:00",
+                        "INBOX",
+                        88,
+                        None,
+                        None,
+                        {"account": "personal"},
+                    )
+                    connection.execute(
+                        "UPDATE audit_events SET b2_uploaded_at = 'now'"
+                    )
+
+                with mock.patch.object(
+                    archiver, "send_pushover_message"
+                ) as send:
+                    archiver.send_pending_alerts(
+                        connection,
+                        archiver.runtime_paths("personal"),
+                        {
+                            "PUSHOVER_APP_TOKEN": "test-token",
+                            "PUSHOVER_USER_KEY": "test-user",
+                        },
+                    )
+
+                send.assert_not_called()
+                events = {
+                    row["event_key"]: row
+                    for row in connection.execute(
+                        "SELECT event_key, alerted_at, last_alert_error "
+                        "FROM audit_events"
+                    ).fetchall()
+                }
+                self.assertIsNotNone(events["legacy-message"]["alerted_at"])
+                self.assertEqual(
+                    events["legacy-message"]["last_alert_error"],
+                    "suppressed: message body preview unavailable",
+                )
+                self.assertIsNotNone(events["folder-reset"]["alerted_at"])
+                self.assertEqual(
+                    events["folder-reset"]["last_alert_error"],
+                    "suppressed: event type is not alertable",
+                )
+            finally:
+                connection.close()
+
     def test_compact_alert_uses_account_prefix_and_body_preview(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connection = archiver.initialize_database(
