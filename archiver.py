@@ -51,6 +51,11 @@ SQLITE_UID_BATCH_SIZE = 900
 PUSHOVER_MESSAGES_URL = "https://api.pushover.net/1/messages.json"
 ALERT_BODY_PREVIEW_CHARACTERS = 50
 BODY_PREVIEW_UNAVAILABLE = "Body unavailable"
+ALERTABLE_EVENT_TYPES = (
+    "trash_observed",
+    "trash_disappeared",
+    "unexplained_disappearance",
+)
 
 LOG = logging.getLogger("yah-arch")
 STOP_REQUESTED = False
@@ -2226,14 +2231,52 @@ def send_pending_alerts(
     pushover_config: dict[str, str],
     limit: int = 50,
 ) -> None:
+    event_placeholders = ",".join("?" for _event in ALERTABLE_EVENT_TYPES)
+    suppressed_at = iso_utc()
+    with database:
+        non_alertable = database.execute(
+            "UPDATE audit_events SET alerted_at = ?, "
+            "last_alert_error = 'suppressed: event type is not alertable' "
+            "WHERE b2_uploaded_at IS NOT NULL AND alerted_at IS NULL "
+            f"AND event_type NOT IN ({event_placeholders})",
+            (suppressed_at, *ALERTABLE_EVENT_TYPES),
+        ).rowcount
+        unavailable = database.execute(
+            "UPDATE audit_events SET alerted_at = ?, "
+            "last_alert_error = 'suppressed: message body preview unavailable' "
+            "WHERE b2_uploaded_at IS NOT NULL AND alerted_at IS NULL "
+            f"AND event_type IN ({event_placeholders}) AND NOT EXISTS ("
+            "SELECT 1 FROM archive_objects AS objects "
+            "WHERE objects.sha256 = audit_events.sha256 "
+            "AND objects.body_preview IS NOT NULL "
+            "AND TRIM(objects.body_preview) <> '' "
+            "AND objects.body_preview <> ?)",
+            (
+                suppressed_at,
+                *ALERTABLE_EVENT_TYPES,
+                BODY_PREVIEW_UNAVAILABLE,
+            ),
+        ).rowcount
+    if non_alertable or unavailable:
+        LOG.info(
+            "Suppressed non-actionable notification backlog: "
+            "event-type=%s preview-unavailable=%s",
+            non_alertable,
+            unavailable,
+        )
+
     rows = database.execute(
         "SELECT events.event_key, objects.body_preview "
         "FROM audit_events AS events "
-        "LEFT JOIN archive_objects AS objects ON objects.sha256 = events.sha256 "
+        "JOIN archive_objects AS objects ON objects.sha256 = events.sha256 "
         "WHERE events.b2_uploaded_at IS NOT NULL "
         "AND events.alerted_at IS NULL "
+        f"AND events.event_type IN ({event_placeholders}) "
+        "AND objects.body_preview IS NOT NULL "
+        "AND TRIM(objects.body_preview) <> '' "
+        "AND objects.body_preview <> ? "
         "ORDER BY events.observed_at, events.event_key LIMIT ?",
-        (limit,),
+        (*ALERTABLE_EVENT_TYPES, BODY_PREVIEW_UNAVAILABLE, limit),
     ).fetchall()
     for row in rows:
         event_key = str(row["event_key"])
