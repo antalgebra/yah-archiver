@@ -14,8 +14,9 @@ Object-Locked B2 bucket. After that upload succeeds, a compact Pushover alert is
 sent with title `YahArch:<first 7 account characters>` and the first 50
 normalized characters of the visible message body. Plain text is preferred;
 attachments and HTML markup are excluded. This deliberately shares that short
-excerpt with Pushover. Messages archived before preview support may instead say
-`Body unavailable`. The companion
+excerpt with Pushover. Audit-only events and messages without a locally cached
+body preview are retained as evidence but suppressed from Pushover, preventing
+legacy or diagnostic backlogs from creating blank notification storms. The companion
 `yah-archive-ops` project monitors archive health, `yah-deleted-onedrive`
 provides a copy-only OneDrive mirror, and `yah-archive-crawler` is reserved for
 read-only analysis.
@@ -111,6 +112,10 @@ monitoring enabled so IMAP, B2, or notification failures are surfaced promptly.
   removed or changed.
 - Alerts are normal-priority Pushover notifications and are retried after
   delivery failures. Archiving continues while Pushover is unavailable.
+- Only `trash_observed`, `trash_disappeared`, and
+  `unexplained_disappearance` events with a cached visible-body preview are
+  eligible for Pushover. Diagnostic events and legacy messages without a
+  preview remain in SQLite and B2 but are marked as notification-suppressed.
 
 ## Multi-account layout
 
